@@ -6,12 +6,12 @@ If you desire to install the package on your system, make sure that you do not h
 
 After checking, you can run the following command:
 
-`git clone https://github.com/wandersoncferreira/dotfiles ~/.emacs.d`
+`git clone https://github.com/ymussi/dotfiles ~/.emacs.d`
 
 If you prefer, you can clone the repository into your `home` folder and later add a `symlink` to `~/.emacs.d`.
 
 ```shell
-git clone https://github.com/wandersoncferreira/dotfiles
+git clone https://github.com/ymussi/dotfiles
 ln -s dotfiles ~/.emacs.d
 ```
 
