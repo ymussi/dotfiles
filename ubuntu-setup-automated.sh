@@ -15,7 +15,7 @@ set -e  # Exit on error
 GIT_USER_NAME="Yuri Mussi"
 GIT_USER_EMAIL="ymussi@gmail.com"
 GIT_EDITOR="vi"
-BACKUP_DIR="${HOME}/Downloads/files/backup-acer-teck"
+BACKUP_DIR="${HOME}/Documents/backup-thinkpad-1"
 
 # Cores para output
 RED='\033[0;31m'
