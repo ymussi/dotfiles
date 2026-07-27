@@ -89,7 +89,9 @@ if [ -f "$HOME/.ssh/config" ]; then
 fi
 
 echo "## Dotfiles incluidos" >> "$MANIFEST"
-ls "$BACKUP_DIR/dotfiles" | sed 's/^/- /' >> "$MANIFEST"
+# -A (nao so "ls" puro): todo arquivo aqui comeca com "." e "ls" sem -a/-A
+# nao lista ocultos por padrao - sem isso a secao saia sempre vazia no manifesto.
+ls -A "$BACKUP_DIR/dotfiles" | sed 's/^/- /' >> "$MANIFEST"
 echo "" >> "$MANIFEST"
 
 #==============================================================================
