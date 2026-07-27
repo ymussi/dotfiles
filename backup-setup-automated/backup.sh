@@ -19,10 +19,14 @@
 # O backup fica dentro de <destino>/<hostname>-<data>/ e contem:
 #   dotfiles/     arquivos de configuracao de shell/git (texto puro, sem segredo)
 #   secrets.tar.gpg  tar criptografado (AES256, senha) com ssh/aws/kube/docker/
-#                    gnupg/terraform.d/.zsh_secrets
+#                    gnupg/terraform.d/.zsh_secrets/VPNs (openvpn3 e NetworkManager)
 #   inventory/    listas de pacotes/extensoes/envs conda/versao node/dconf/crontab
 #   data/         Documents, Pictures, projects (e Downloads se pedido)
 #   MANIFEST.md   resumo humano do que foi incluido/excluido
+#
+# Esta etapa pode pedir sua senha de sudo (uma vez) se voce tiver VPNs
+# configuradas em Configuracoes > Rede > VPN (NetworkManager) - precisa de
+# privilegio para exportar os metadados dessas conexoes.
 #==============================================================================
 set -euo pipefail
 
@@ -159,8 +163,38 @@ if command -v openvpn3 >/dev/null 2>&1; then
         [ -z "$vpn_name" ] && continue
         openvpn3 config-dump -c "$vpn_name" > "$SECRETS_STAGE/openvpn3/${vpn_name}.ovpn" 2>/dev/null \
             && secret_paths_found+=("openvpn3/${vpn_name}.ovpn")
-    done < <(openvpn3 configs-list 2>/dev/null | tail -n +3 | awk '{print $1}')
+    done < <(openvpn3 configs-list 2>/dev/null | tail -n +3 | grep -v '^-*$' | awk '{print $1}')
 fi
+
+# Conexoes VPN do NetworkManager (Configuracoes > Rede > VPN - diferente do
+# openvpn3 acima). Certificados TLS ficam em ~/.cert/nm-openvpn (nivel de
+# usuario, sem sudo); ja o "nmcli connection export" pede sudo pra ler os
+# metadados da conexao em si. Sem senha guardada normalmente (NetworkManager
+# pede na hora de conectar) - so os certificados/config sao migraveis aqui.
+if command -v nmcli >/dev/null 2>&1; then
+    mkdir -p "$SECRETS_STAGE/networkmanager-vpn"
+    while IFS=: read -r vpn_name vpn_type; do
+        [ "$vpn_type" = "vpn" ] || continue
+        [ -z "$vpn_name" ] && continue
+        if sudo -n true 2>/dev/null || sudo -v 2>/dev/null; then
+            if sudo nmcli connection export "$vpn_name" "$SECRETS_STAGE/networkmanager-vpn/${vpn_name}.ovpn" 2>/dev/null; then
+                sudo chown "$(id -u):$(id -g)" "$SECRETS_STAGE/networkmanager-vpn/${vpn_name}.ovpn" 2>/dev/null || true
+                secret_paths_found+=("networkmanager-vpn/${vpn_name}.ovpn")
+                info "✓ conexão NetworkManager VPN exportada: $vpn_name"
+            else
+                warn "Falha ao exportar conexão NetworkManager VPN '$vpn_name'"
+            fi
+        else
+            warn "Sem sudo disponível - pulando exportação da VPN NetworkManager '$vpn_name'"
+        fi
+    done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null)
+fi
+copy_if_exists "$HOME/.cert/nm-openvpn" "cert/nm-openvpn"
+
+# Guarda o $HOME de origem para o restore conseguir reescrever os paths de
+# certificado dentro dos .ovpn exportados acima, caso o usuario Linux seja
+# diferente na maquina nova (ex: "mussi" -> "yuri-mussi").
+echo "$HOME" > "$BACKUP_DIR/inventory/source-home.txt"
 
 # PATs opcionais que o usuario queira incluir para automatizar auth na maquina
 # nova (ex: gh, terraform cloud). So entram se o arquivo existir - nunca gerados.

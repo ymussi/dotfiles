@@ -275,6 +275,20 @@ restore_secrets() {
         mkdir -p ~/.cache/openvpn3-profiles-to-import
         rsync -a "$stage/openvpn3/" ~/.cache/openvpn3-profiles-to-import/
     fi
+    # Certificados TLS das VPNs do NetworkManager (cliente cert+key+ca) - sao
+    # arquivos de usuario normais, restauram junto com o resto.
+    if [ -d "$stage/cert/nm-openvpn" ]; then
+        mkdir -p ~/.cert
+        rsync -a --update "$stage/cert/nm-openvpn/" ~/.cert/nm-openvpn/
+        info "✓ certificados de VPN (NetworkManager) restaurados"
+    fi
+    # As conexoes VPN do NetworkManager (.ovpn exportado) so podem ser
+    # importadas depois que o plugin network-manager-openvpn estiver
+    # instalado (mais adiante), entao so guardamos aqui pra importar depois.
+    if [ -d "$stage/networkmanager-vpn" ]; then
+        mkdir -p ~/.cache/nm-vpn-profiles-to-import
+        rsync -a "$stage/networkmanager-vpn/" ~/.cache/nm-vpn-profiles-to-import/
+    fi
 
     # Permissões corretas
     chmod 700 ~/.ssh ~/.aws ~/.gnupg 2>/dev/null || true
@@ -813,6 +827,11 @@ if command -v openvpn3 >/dev/null 2>&1 && [ -d ~/.cache/openvpn3-profiles-to-imp
     for ovpn in ~/.cache/openvpn3-profiles-to-import/*.ovpn; do
         [ -f "$ovpn" ] || continue
         name="$(basename "$ovpn" .ovpn)"
+        # Backups antigos podem ter capturado a linha de separador ("---...")
+        # do "openvpn3 configs-list" como se fosse nome de perfil - ignora.
+        case "$name" in
+            -*) continue ;;
+        esac
         if openvpn3 configs-list 2>/dev/null | grep -q "^${name} "; then
             skip "perfil openvpn3 '$name' já existe"
         else
@@ -822,6 +841,45 @@ if command -v openvpn3 >/dev/null 2>&1 && [ -d ~/.cache/openvpn3-profiles-to-imp
         fi
     done
     rm -rf ~/.cache/openvpn3-profiles-to-import
+fi
+
+#==============================================================================
+# NETWORKMANAGER VPN (plugin OpenVPN - Configurações > Rede > VPN)
+#==============================================================================
+section "Instalando plugin OpenVPN do NetworkManager"
+
+if ! dpkg -l network-manager-openvpn 2>/dev/null | grep -q "^ii"; then
+    sudo apt-get install -y network-manager-openvpn network-manager-openvpn-gnome \
+        && info "✅ network-manager-openvpn instalado" \
+        || warn "Falha ao instalar network-manager-openvpn"
+else
+    skip "network-manager-openvpn já instalado"
+fi
+
+# Importa conexões VPN do NetworkManager extraídas do backup. Os .ovpn
+# exportados referenciam os certificados pelo caminho absoluto da máquina de
+# origem (ex: /home/mussi/.cert/...) - se o usuário Linux for diferente aqui
+# (ex: yuri-mussi), reescrevemos o path antes de importar.
+if command -v nmcli >/dev/null 2>&1 && [ -d ~/.cache/nm-vpn-profiles-to-import ]; then
+    OLD_HOME="$(cat "$BACKUP_DIR/inventory/source-home.txt" 2>/dev/null || true)"
+    for ovpn in ~/.cache/nm-vpn-profiles-to-import/*.ovpn; do
+        [ -f "$ovpn" ] || continue
+        vpn_name="$(basename "$ovpn" .ovpn)"
+        if nmcli connection show "$vpn_name" >/dev/null 2>&1; then
+            skip "conexão NetworkManager VPN '$vpn_name' já existe"
+            continue
+        fi
+        fixed="${ovpn}.fixed"
+        if [ -n "$OLD_HOME" ] && [ "$OLD_HOME" != "$HOME" ]; then
+            sed "s#${OLD_HOME}#${HOME}#g" "$ovpn" > "$fixed"
+        else
+            cp "$ovpn" "$fixed"
+        fi
+        sudo nmcli connection import type openvpn file "$fixed" >/dev/null 2>&1 \
+            && info "✓ conexão NetworkManager VPN '$vpn_name' importada (usuário/senha serão pedidos na 1ª conexão)" \
+            || warn "Falha ao importar conexão NetworkManager VPN '$vpn_name'"
+    done
+    rm -rf ~/.cache/nm-vpn-profiles-to-import
 fi
 
 #==============================================================================
@@ -1086,10 +1144,18 @@ if [ "$HAS_BACKUP" = true ]; then
     check_item "Config do Claude Code (~/.claude.json)" ~/.claude.json
     check_item "Histórico de conversas do Claude Code" ~/.claude/projects
     if command -v openvpn3 >/dev/null 2>&1 && [ -f "$BACKUP_DIR/secrets.tar.gpg" ]; then
-        if openvpn3 configs-list 2>/dev/null | tail -n +3 | grep -q .; then
+        if openvpn3 configs-list 2>/dev/null | tail -n +3 | grep -v '^-*$' | grep -q .; then
             echo -e "  ${GREEN}✅${NC} Perfil(is) VPN importado(s) no openvpn3"
         else
             echo -e "  ${YELLOW}⚠${NC}  Nenhum perfil VPN encontrado no openvpn3 (pode ser que você não tinha nenhum)"
+        fi
+    fi
+    check_item "Certificados de VPN NetworkManager (~/.cert/nm-openvpn)" ~/.cert/nm-openvpn
+    if command -v nmcli >/dev/null 2>&1; then
+        if nmcli -t -f TYPE connection show 2>/dev/null | grep -q '^vpn$'; then
+            echo -e "  ${GREEN}✅${NC} Conexão(ões) VPN do NetworkManager importada(s)"
+        else
+            echo -e "  ${YELLOW}⚠${NC}  Nenhuma conexão VPN do NetworkManager encontrada (pode ser que você não tinha nenhuma)"
         fi
     fi
 
@@ -1143,7 +1209,7 @@ echo "  ✓ Node.js (via NVM) + pacotes npm globais"
 echo "  ✓ Docker + Docker Compose (plugin)"
 echo "  ✓ AWS CLI v2 + Session Manager"
 echo "  ✓ Terraform, kubectl, Helm, k9s, ArgoCD CLI"
-echo "  ✓ GitHub CLI, Claude Code, OpenVPN3 (+ perfil restaurado), FreeRDP3"
+echo "  ✓ GitHub CLI, Claude Code, OpenVPN3 (+ perfil restaurado), NetworkManager VPN (+ certificados/conexão restaurados), FreeRDP3"
 echo "  ✓ VS Code + extensões + settings"
 echo "  ✓ Chrome, Slack, Spotify, DBeaver (+ conexões restauradas), Postman, Telegram, TeamViewer"
 echo "  ✓ kubectx, kubens, stern, trivy, lazygit, btop, neofetch"
@@ -1163,8 +1229,8 @@ echo "  1. Se a chave SSH é nova, adicione-a no GitHub/GitLab."
 echo "  2. Se usa 'gh auth login' pela primeira vez (sem backup de ~/.config/gh), rode e autentique com seu usuário/token."
 echo "  3. 'aws sso login --profile <perfil>' para renovar sessões SSO (tokens SSO expiram em horas, sempre exigem"
 echo "     aprovação no navegador - isso é proposital, não dá pra pular)."
-echo "  4. 'vpnup' (openvpn3) vai pedir usuário/senha na primeira conexão - a senha não é restaurada automaticamente"
-echo "     de propósito (só o perfil de conexão foi importado, ver ~/.zsh_secrets pra lembrar a senha antiga)."
+echo "  4. 'vpnup' (openvpn3) e a VPN do NetworkManager (Configurações > Rede > VPN) vão pedir usuário/senha na"
+echo "     primeira conexão - nenhuma das duas guarda senha (nem a original guardava), então não tem como automatizar."
 echo "  5. Login manual em apps com conta própria: Chrome, Slack, Spotify, Telegram, Postman (não são arquivo, são OAuth/conta)."
 echo "  6. Imagens/containers/volumes do Docker da máquina antiga NÃO foram copiados (ficam só na origem)."
 echo "  7. Reinicie a sessão (logout/login ou 'sudo reboot') para: grupo docker, shell padrão zsh."
