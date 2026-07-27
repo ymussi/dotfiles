@@ -166,6 +166,18 @@ restore_secrets() {
         cp -p "$stage/gh/hosts.yml" ~/.config/gh/hosts.yml
         chmod 600 ~/.config/gh/hosts.yml
     fi
+    if [ -d "$stage/dbeaver/DBeaverData" ]; then
+        mkdir -p ~/.local/share
+        cp -rp "$stage/dbeaver/DBeaverData" ~/.local/share/DBeaverData
+        info "✓ conexões do DBeaver restauradas"
+    fi
+    # Perfis openvpn3 so podem ser importados depois que o pacote "openvpn3"
+    # estiver instalado (mais adiante no script), entao so guardamos os
+    # arquivos .ovpn aqui num lugar persistente e importamos depois.
+    if [ -d "$stage/openvpn3" ]; then
+        mkdir -p ~/.cache/openvpn3-profiles-to-import
+        cp -rp "$stage/openvpn3/." ~/.cache/openvpn3-profiles-to-import/
+    fi
 
     # Permissões corretas
     chmod 700 ~/.ssh ~/.aws ~/.gnupg 2>/dev/null || true
@@ -464,8 +476,16 @@ restore_npm_globals() {
 
 if [ "$HAS_BACKUP" = true ]; then
     run_step "restaurar pacotes npm globais" restore_npm_globals
-else
+fi
+
+# Garantia extra: gemini-cli e usado direto (alias "gem") e pode ter sido
+# instalado na maquina de origem via npm do sistema (fora do nvm), o que o
+# backup antigo pode nao ter capturado - reinstala aqui independente do
+# inventario, e' idempotente.
+if ! command -v gemini >/dev/null 2>&1; then
     npm install -g @google/gemini-cli >/dev/null 2>&1 && info "✓ gemini-cli instalado" || warn "Falha ao instalar gemini-cli"
+else
+    skip "gemini-cli já instalado"
 fi
 
 #==============================================================================
@@ -646,6 +666,23 @@ else
     skip "xfreerdp3 já instalado"
 fi
 
+# Importa perfis openvpn3 extraídos do backup (deixados em
+# ~/.cache/openvpn3-profiles-to-import pela etapa de restauração de segredos).
+if command -v openvpn3 >/dev/null 2>&1 && [ -d ~/.cache/openvpn3-profiles-to-import ]; then
+    for ovpn in ~/.cache/openvpn3-profiles-to-import/*.ovpn; do
+        [ -f "$ovpn" ] || continue
+        name="$(basename "$ovpn" .ovpn)"
+        if openvpn3 configs-list 2>/dev/null | grep -q "^${name} "; then
+            skip "perfil openvpn3 '$name' já existe"
+        else
+            openvpn3 config-import --config "$ovpn" --name "$name" --persistent >/dev/null 2>&1 \
+                && info "✓ perfil openvpn3 '$name' importado" \
+                || warn "Falha ao importar perfil openvpn3 '$name'"
+        fi
+    done
+    rm -rf ~/.cache/openvpn3-profiles-to-import
+fi
+
 #==============================================================================
 # VSCODE
 #==============================================================================
@@ -685,6 +722,12 @@ else
         code --install-extension "$ext" --force > /dev/null 2>&1
     done
     info "✅ Extensões padrão do VS Code instaladas"
+fi
+
+if [ "$HAS_BACKUP" = true ] && [ -d "$BACKUP_DIR/inventory/vscode-user" ]; then
+    mkdir -p ~/.config/Code/User
+    cp -rp "$BACKUP_DIR"/inventory/vscode-user/. ~/.config/Code/User/
+    info "✅ settings/keybindings/snippets do VS Code restaurados do backup"
 fi
 
 #==============================================================================
@@ -875,8 +918,13 @@ echo ""
 echo "💡 Próximos passos manuais (não dá pra automatizar com segurança):"
 echo "  1. Se a chave SSH é nova, adicione-a no GitHub/GitLab."
 echo "  2. Se usa 'gh auth login' pela primeira vez (sem backup de ~/.config/gh), rode e autentique com seu usuário/token."
-echo "  3. 'aws sso login --profile <perfil>' para renovar sessões SSO (tokens SSO expiram e não são reaproveitáveis)."
-echo "  4. Reinicie a sessão (logout/login ou 'sudo reboot') para: grupo docker, shell padrão zsh."
+echo "  3. 'aws sso login --profile <perfil>' para renovar sessões SSO (tokens SSO expiram em horas, sempre exigem"
+echo "     aprovação no navegador - isso é proposital, não dá pra pular)."
+echo "  4. 'vpnup' (openvpn3) vai pedir usuário/senha na primeira conexão - a senha não é restaurada automaticamente"
+echo "     de propósito (só o perfil de conexão foi importado, ver ~/.zsh_secrets pra lembrar a senha antiga)."
+echo "  5. Login manual em apps com conta própria: Chrome, Slack, Spotify, Telegram, Postman (não são arquivo, são OAuth/conta)."
+echo "  6. Imagens/containers/volumes do Docker da máquina antiga NÃO foram copiados (ficam só na origem)."
+echo "  7. Reinicie a sessão (logout/login ou 'sudo reboot') para: grupo docker, shell padrão zsh."
 echo ""
 echo "=============================================="
 echo "Desenvolvido por Yuri Mussi - Julho 2026"

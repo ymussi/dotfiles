@@ -120,6 +120,21 @@ copy_if_exists "$HOME/.zsh_secrets"    "zsh_secrets"
 copy_if_exists "$HOME/tfc-github-key"        "extra/tfc-github-key"
 copy_if_exists "$HOME/tfc-github-key.pub"    "extra/tfc-github-key.pub"
 
+# DBeaver guarda conexoes/senhas de banco em ~/.local/share/DBeaverData/workspace6/.../
+# (pasta "secure" tem credenciais). Vai no bundle criptografado, nao em data/.
+copy_if_exists "$HOME/.local/share/DBeaverData" "dbeaver/DBeaverData"
+
+# Perfis de VPN importados no openvpn3 nao ficam em nenhum arquivo de config
+# comum - precisam ser extraidos via "config-dump" um a um.
+if command -v openvpn3 >/dev/null 2>&1; then
+    mkdir -p "$SECRETS_STAGE/openvpn3"
+    while IFS= read -r vpn_name; do
+        [ -z "$vpn_name" ] && continue
+        openvpn3 config-dump -c "$vpn_name" > "$SECRETS_STAGE/openvpn3/${vpn_name}.ovpn" 2>/dev/null \
+            && secret_paths_found+=("openvpn3/${vpn_name}.ovpn")
+    done < <(openvpn3 configs-list 2>/dev/null | tail -n +3 | awk '{print $1}')
+fi
+
 # PATs opcionais que o usuario queira incluir para automatizar auth na maquina
 # nova (ex: gh, terraform cloud). So entram se o arquivo existir - nunca gerados.
 copy_if_exists "$HOME/.config/gh/hosts.yml"        "gh/hosts.yml"
@@ -178,14 +193,52 @@ info "✓ pacotes apt (manuais): $(wc -l < "$INV/apt-manual.txt" 2>/dev/null || 
 command -v snap >/dev/null 2>&1 && snap list 2>/dev/null | tail -n +2 | awk '{print $1}' > "$INV/snap-list.txt" || true
 info "✓ pacotes snap: $(wc -l < "$INV/snap-list.txt" 2>/dev/null || echo 0)"
 
+# Extrai nomes de pacotes de "npm ls -g --parseable", preservando o escopo
+# (ex: /.../node_modules/@google/gemini-cli -> "@google/gemini-cli"; um
+# basename() simples cortaria o "@google/" e quebraria o "npm install -g" no
+# restore, tentando instalar um pacote com nome errado/inexistente).
+extract_npm_names() {
+    while IFS= read -r path; do
+        [ -z "$path" ] && continue
+        local parent; parent="$(basename "$(dirname "$path")")"
+        local name; name="$(basename "$path")"
+        if [[ "$parent" == @* ]]; then
+            echo "${parent}/${name}"
+        else
+            echo "$name"
+        fi
+    done
+}
+
 if command -v npm >/dev/null 2>&1; then
-    npm ls -g --depth=0 --parseable 2>/dev/null | tail -n +2 | xargs -r -n1 basename > "$INV/npm-global.txt" || true
-    info "✓ pacotes npm globais: $(wc -l < "$INV/npm-global.txt" 2>/dev/null || echo 0)"
+    npm ls -g --depth=0 --parseable 2>/dev/null | tail -n +2 | extract_npm_names > "$INV/npm-global.txt" || true
+fi
+# Alem do npm ativo (ex: gerenciado por nvm), tambem capturamos o npm do
+# sistema (/usr/bin/npm, via apt), pois instalacoes feitas com "sudo npm
+# install -g" caem la (sudo ignora o PATH/shims do nvm) e ficariam de fora.
+if [ -x /usr/bin/npm ] && [ "$(command -v npm 2>/dev/null)" != "/usr/bin/npm" ]; then
+    /usr/bin/npm ls -g --depth=0 --parseable 2>/dev/null | tail -n +2 | extract_npm_names >> "$INV/npm-global.txt" || true
+fi
+if [ -f "$INV/npm-global.txt" ]; then
+    sort -u -o "$INV/npm-global.txt" "$INV/npm-global.txt"
+    info "✓ pacotes npm globais (nvm + sistema): $(wc -l < "$INV/npm-global.txt")"
 fi
 
 if command -v code >/dev/null 2>&1; then
     code --list-extensions > "$INV/vscode-extensions.txt" 2>/dev/null || true
     info "✓ extensoes VS Code: $(wc -l < "$INV/vscode-extensions.txt" 2>/dev/null || echo 0)"
+fi
+
+# Config do VS Code (so o que e leve e util: settings/keybindings/snippets).
+# globalStorage/History/workspaceStorage sao cache pesado e regeneravel, entao
+# ficam de fora de proposito.
+if [ -d "$HOME/.config/Code/User" ]; then
+    mkdir -p "$INV/vscode-user"
+    for f in settings.json keybindings.json; do
+        [ -f "$HOME/.config/Code/User/$f" ] && cp -p "$HOME/.config/Code/User/$f" "$INV/vscode-user/$f"
+    done
+    [ -d "$HOME/.config/Code/User/snippets" ] && cp -rp "$HOME/.config/Code/User/snippets" "$INV/vscode-user/snippets"
+    info "✓ configuração do VS Code (settings/keybindings/snippets)"
 fi
 
 if command -v node >/dev/null 2>&1; then
