@@ -171,6 +171,16 @@ restore_secrets() {
         cp -rp "$stage/dbeaver/DBeaverData" ~/.local/share/DBeaverData
         info "✓ conexões do DBeaver restauradas"
     fi
+    if [ -f "$stage/claude/.claude.json" ]; then
+        cp -p "$stage/claude/.claude.json" ~/.claude.json
+        chmod 600 ~/.claude.json
+    fi
+    if [ -d "$stage/claude/dotclaude" ]; then
+        mkdir -p ~/.claude
+        cp -rp "$stage/claude/dotclaude/." ~/.claude/
+        chmod 600 ~/.claude/.credentials.json 2>/dev/null || true
+        info "✓ Claude Code restaurado (histórico de conversas + credenciais)"
+    fi
     # Perfis openvpn3 so podem ser importados depois que o pacote "openvpn3"
     # estiver instalado (mais adiante no script), entao so guardamos os
     # arquivos .ovpn aqui num lugar persistente e importamos depois.
@@ -644,6 +654,20 @@ else
 fi
 
 #==============================================================================
+# CLAUDE CODE
+#==============================================================================
+section "Instalando Claude Code"
+
+if ! command -v claude &> /dev/null; then
+    install_claude_code() {
+        curl -fsSL https://claude.ai/install.sh | bash
+    }
+    run_step "instalar Claude Code" install_claude_code && info "✅ Claude Code instalado"
+else
+    skip "Claude Code já instalado"
+fi
+
+#==============================================================================
 # OPENVPN3 & XFREERDP3
 #==============================================================================
 section "Instalando OpenVPN3 e FreeRDP3"
@@ -832,6 +856,36 @@ fi
 info "✅ Ferramentas adicionais instaladas"
 
 #==============================================================================
+# OUTRAS FERRAMENTAS (vistas no seu apt-manual.txt e ainda não cobertas acima)
+#==============================================================================
+section "Instalando outras ferramentas de uso comum"
+
+# Direto dos repositorios padrao do Ubuntu, sem repo extra - seguro instalar
+# em lote. Deliberadamente NAO incluidos aqui: pacotes de bootloader/kernel
+# (grub, efibootmgr, shim-signed, linux-generic-hwe-*), meta-pacotes do Ubuntu
+# (ubuntu-minimal/standard/desktop-minimal, ja vem na instalacao do sistema) e
+# IME/idioma chines (ibus-table-cangjie*, libchewing*, libpinyin*, m17n-db)
+# que sao dependencias automaticas, nao escolhas suas.
+sudo apt-get install -y \
+    ffmpeg htop nmap traceroute whois tree vlc pdfarranger \
+    remmina samba-common-bin simple-scan wireguard ubuntu-restricted-addons \
+    libreoffice 2>/dev/null \
+    && info "✅ ffmpeg, htop, nmap, traceroute, whois, tree, vlc, pdfarranger, remmina, samba, simple-scan, wireguard, libreoffice instalados" \
+    || warn "Algum pacote da lista extra falhou (verifique manualmente com apt-get install <pacote>)"
+
+# TeamViewer nao esta nos repos padrao - precisa do .deb oficial.
+if ! command -v teamviewer &> /dev/null; then
+    install_teamviewer() {
+        wget -q -O /tmp/teamviewer.deb "https://download.teamviewer.com/download/linux/teamviewer_amd64.deb"
+        sudo apt-get install -y /tmp/teamviewer.deb
+        rm -f /tmp/teamviewer.deb
+    }
+    run_step "instalar TeamViewer" install_teamviewer && info "✅ TeamViewer instalado"
+else
+    skip "TeamViewer já instalado"
+fi
+
+#==============================================================================
 # RESTAURAR DADOS (Documents, Pictures, projects, Downloads se presente)
 #==============================================================================
 section "Restaurando dados do usuário"
@@ -901,10 +955,11 @@ echo "  ✓ Node.js (via NVM) + pacotes npm globais"
 echo "  ✓ Docker + Docker Compose (plugin)"
 echo "  ✓ AWS CLI v2 + Session Manager"
 echo "  ✓ Terraform, kubectl, Helm, k9s, ArgoCD CLI"
-echo "  ✓ GitHub CLI, OpenVPN3, FreeRDP3"
-echo "  ✓ VS Code + extensões"
-echo "  ✓ Chrome, Slack, Spotify, DBeaver, Postman, Telegram"
+echo "  ✓ GitHub CLI, Claude Code, OpenVPN3 (+ perfil restaurado), FreeRDP3"
+echo "  ✓ VS Code + extensões + settings"
+echo "  ✓ Chrome, Slack, Spotify, DBeaver (+ conexões restauradas), Postman, Telegram, TeamViewer"
 echo "  ✓ kubectx, kubens, stern, trivy, lazygit, btop, neofetch"
+echo "  ✓ ffmpeg, htop, nmap, vlc, remmina, LibreOffice, wireguard e outras ferramentas do seu apt-manual.txt"
 echo ""
 if [ "$HAS_BACKUP" = true ]; then
 echo "📁 Dados restaurados do backup: $BACKUP_DIR"

@@ -140,6 +140,21 @@ fi
 copy_if_exists "$HOME/.config/gh/hosts.yml"        "gh/hosts.yml"
 copy_if_exists "$HOME/.terraformrc"                "extra/.terraformrc"
 
+# Claude Code: credenciais (~/.claude.json e ~/.claude/.credentials.json) e
+# historico/config (~/.claude - conversas, projects, settings, plugins).
+# Fica no bundle criptografado por ter tokens de auth + conteudo de conversas
+# que pode incluir codigo/infra sensivel de cliente. Exclui subpastas que sao
+# so cache/regeneravel (nao valem o espaco).
+copy_if_exists "$HOME/.claude.json" "claude/.claude.json"
+if [ -d "$HOME/.claude" ]; then
+    mkdir -p "$SECRETS_STAGE/claude/dotclaude"
+    rsync -a \
+        --exclude cache/ --exclude downloads/ --exclude session-env/ \
+        --exclude shell-snapshots/ --exclude file-history/ --exclude paste-cache/ \
+        "$HOME/.claude/" "$SECRETS_STAGE/claude/dotclaude/" 2>/dev/null
+    secret_paths_found+=("claude/dotclaude (historico de conversas + credenciais do Claude Code)")
+fi
+
 if [ "${#secret_paths_found[@]}" -eq 0 ]; then
     warn "Nada encontrado para o bundle de segredos, pulando."
 else
