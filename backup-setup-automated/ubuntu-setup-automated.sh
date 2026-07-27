@@ -186,20 +186,33 @@ restore_secrets() {
     [ -f "$secrets_tar" ] || { warn "secrets.tar.gpg não encontrado no backup, pulando restauração de segredos."; return 1; }
 
     local stage; stage="$(mktemp -d)"
-    # Ate 3 tentativas de senha - uma senha errada digitada uma vez sozinha
-    # faria TUDO (SSH, AWS, kube, docker, gnupg, terraform, DBeaver, VPN,
-    # historico) falhar silenciosamente, com so 1 linha de aviso perdida no
-    # meio de centenas de linhas de apt-get install.
-    local tentativa ok=false
+    # Ate 3 tentativas de senha. IMPORTANTE: lemos a senha explicitamente com
+    # "read -s" e passamos via --passphrase (igual o backup.sh faz na hora de
+    # criptografar), em vez de deixar o gpg tentar pedir a senha sozinho via
+    # --pinentry-mode loopback sem --passphrase - isso pode falhar
+    # silenciosamente dependendo do terminal/gpg-agent (prompt do gpg vai pro
+    # stderr e nunca aparece, ou o gpg nem chega a perguntar nada). Tambem
+    # mostramos o erro real do gpg em vez de esconder com 2>/dev/null, para
+    # nao mascarar um problema tecnico como se fosse "senha errada".
+    local tentativa ok=false RESTORE_PASS
     for tentativa in 1 2 3; do
-        info "Digite a senha usada no backup.sh para descriptografar os segredos (tentativa $tentativa/3):"
-        if gpg --batch --yes --pinentry-mode loopback -o "$stage/secrets.tar" -d "$secrets_tar" 2>/dev/null; then
+        read -r -s -p "Digite a senha usada no backup.sh para descriptografar os segredos (tentativa $tentativa/3): " RESTORE_PASS
+        echo
+        if [ -z "$RESTORE_PASS" ]; then
+            error "Senha vazia, tente de novo."
+            continue
+        fi
+        if gpg --batch --yes --pinentry-mode loopback --passphrase "$RESTORE_PASS" \
+            -o "$stage/secrets.tar" -d "$secrets_tar" 2>"$stage/gpg_err.log"; then
             ok=true
+            unset RESTORE_PASS
             break
         else
-            error "Senha incorreta ou falha ao descriptografar. Tente de novo."
+            error "Falha ao descriptografar (senha incorreta ou outro erro abaixo):"
+            sed 's/^/    /' "$stage/gpg_err.log" >&2
             rm -f "$stage/secrets.tar"
         fi
+        unset RESTORE_PASS
     done
     if [ "$ok" != true ]; then
         error "############################################################"
@@ -1051,7 +1064,13 @@ check_item() {
 
 if [ "$HAS_BACKUP" = true ]; then
     ssh_key_count=$(find ~/.ssh -maxdepth 1 -type f ! -name "*.pub" ! -name "config" ! -name "known_hosts*" ! -name "authorized_keys" 2>/dev/null | wc -l)
-    if [ "$ssh_key_count" -gt 0 ]; then
+    if [ "$ssh_key_count" -eq 1 ] && [ -f ~/.ssh/id_ed25519 ]; then
+        # Sinal forte de que o restore FALHOU: essa e exatamente a chave que
+        # o fallback gera quando nao acha nenhuma chave apos tentar restaurar
+        # do backup - nao e uma chave restaurada de verdade.
+        echo -e "  ${RED}❌${NC} Só existe id_ed25519 (chave NOVA gerada pelo fallback) — suas chaves reais NÃO foram restauradas"
+        VERIFY_FAILED=true
+    elif [ "$ssh_key_count" -gt 0 ]; then
         echo -e "  ${GREEN}✅${NC} Chaves SSH privadas ($ssh_key_count encontrada(s))"
     else
         echo -e "  ${RED}❌${NC} Nenhuma chave SSH privada restaurada em ~/.ssh"
