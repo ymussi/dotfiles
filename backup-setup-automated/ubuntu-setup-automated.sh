@@ -70,21 +70,60 @@ export DEBIAN_FRONTEND=noninteractive
 #==============================================================================
 section "🚀 Iniciando Setup Automatizado"
 
-BACKUP_DIR="${1:-}"
-if [ -z "$BACKUP_DIR" ]; then
+BACKUP_DIR_ARG="${1:-}"
+
+# Se um caminho foi passado explicitamente, ele TEM que existir e parecer um
+# backup de verdade - se nao, aborta com erro alto em vez de silenciosamente
+# cair em "modo sem backup" (que instala tudo do zero e nao restaura NADA:
+# SSH, AWS, kube, docker, gnupg, VPN, historico - sem avisar direito). Essa
+# era a causa mais provavel de AWS/VPN nao terem sido restaurados antes: um
+# path invalido so gerava 1 linha de aviso perdida no meio do log.
+if [ -n "$BACKUP_DIR_ARG" ]; then
+    if [ ! -d "$BACKUP_DIR_ARG" ]; then
+        echo ""
+        echo "############################################################"
+        echo "# ERRO FATAL: o caminho de backup informado nao existe:"
+        echo "#   $BACKUP_DIR_ARG"
+        echo "#"
+        echo "# Abortando de proposito - continuar significaria instalar"
+        echo "# tudo do zero SEM restaurar SSH/AWS/kube/docker/VPN/historico."
+        echo "# Confira o caminho (ls -la para ver o nome exato) e rode de novo."
+        echo "############################################################"
+        exit 1
+    fi
+    if [ ! -f "$BACKUP_DIR_ARG/secrets.tar.gpg" ] && [ ! -d "$BACKUP_DIR_ARG/dotfiles" ] && [ ! -d "$BACKUP_DIR_ARG/data" ]; then
+        echo ""
+        echo "############################################################"
+        echo "# ERRO FATAL: $BACKUP_DIR_ARG existe, mas nao parece um backup"
+        echo "# gerado pelo backup.sh (faltam secrets.tar.gpg, dotfiles/ e"
+        echo "# data/). Confira se o caminho e a pasta RAIZ do backup, nao"
+        echo "# uma subpasta dela."
+        echo "############################################################"
+        exit 1
+    fi
+    BACKUP_DIR="$BACKUP_DIR_ARG"
+    HAS_BACKUP=true
+    info "📦 Backup: $BACKUP_DIR"
+else
     CANDIDATE="$(ls -dt "$HOME"/ubuntu-backup/*/ 2>/dev/null | head -1 || true)"
     if [ -n "$CANDIDATE" ]; then
         BACKUP_DIR="${CANDIDATE%/}"
+        HAS_BACKUP=true
         info "Nenhum backup informado, usando o mais recente encontrado: $BACKUP_DIR"
+    else
+        BACKUP_DIR=""
+        HAS_BACKUP=false
+        echo ""
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo "!! NENHUM BACKUP ENCONTRADO (nem argumento, nem ~/ubuntu-backup/*)   !!"
+        echo "!! Este setup vai rodar em modo GENÉRICO: chave SSH nova, ambiente   !!"
+        echo "!! conda genérico, SEM SSH/AWS/kube/docker/gnupg/VPN/histórico       !!"
+        echo "!! restaurados. Se você esperava restaurar seu backup, cancele       !!"
+        echo "!! agora (Ctrl+C) e rode de novo passando o caminho correto.         !!"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo ""
+        sleep 5
     fi
-fi
-
-if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
-    info "📦 Backup: $BACKUP_DIR"
-    HAS_BACKUP=true
-else
-    warn "Nenhum backup valido encontrado. Seguindo com configuracao genérica (sem restaurar dados antigos)."
-    HAS_BACKUP=false
 fi
 
 info "Usuário: $GIT_USER_NAME"
@@ -137,56 +176,91 @@ section "Restaurando segredos e credenciais"
 mkdir -p ~/.ssh ~/.aws ~/.kube ~/.docker
 chmod 700 ~/.ssh ~/.aws
 
+# Necessario para o prompt de senha do gpg funcionar de forma confiavel
+# quando chamado de dentro de um script (sem isso, gpg-agent as vezes nao
+# acha o terminal certo pra pedir a senha e falha silenciosamente).
+export GPG_TTY="$(tty 2>/dev/null || true)"
+
 restore_secrets() {
     local secrets_tar="$BACKUP_DIR/secrets.tar.gpg"
     [ -f "$secrets_tar" ] || { warn "secrets.tar.gpg não encontrado no backup, pulando restauração de segredos."; return 1; }
 
     local stage; stage="$(mktemp -d)"
-    info "Digite a senha usada no backup.sh para descriptografar os segredos:"
-    if ! gpg --batch --yes --pinentry-mode loopback -o "$stage/secrets.tar" -d "$secrets_tar"; then
-        error "Falha ao descriptografar secrets.tar.gpg (senha incorreta?)."
+    # Ate 3 tentativas de senha - uma senha errada digitada uma vez sozinha
+    # faria TUDO (SSH, AWS, kube, docker, gnupg, terraform, DBeaver, VPN,
+    # historico) falhar silenciosamente, com so 1 linha de aviso perdida no
+    # meio de centenas de linhas de apt-get install.
+    local tentativa ok=false
+    for tentativa in 1 2 3; do
+        info "Digite a senha usada no backup.sh para descriptografar os segredos (tentativa $tentativa/3):"
+        if gpg --batch --yes --pinentry-mode loopback -o "$stage/secrets.tar" -d "$secrets_tar" 2>/dev/null; then
+            ok=true
+            break
+        else
+            error "Senha incorreta ou falha ao descriptografar. Tente de novo."
+            rm -f "$stage/secrets.tar"
+        fi
+    done
+    if [ "$ok" != true ]; then
+        error "############################################################"
+        error "# FALHA: nao foi possivel descriptografar secrets.tar.gpg"
+        error "# apos 3 tentativas. SSH, AWS, kube, docker, gnupg,"
+        error "# terraform.d, zsh_secrets, DBeaver, VPN, Claude Code e"
+        error "# historico do zsh NAO foram restaurados nesta execucao."
+        error "# Recupere depois com: gpg -d $secrets_tar | tar -tv"
+        error "############################################################"
         rm -rf "$stage"
         return 1
     fi
     tar -C "$stage" -xf "$stage/secrets.tar"
     rm -f "$stage/secrets.tar"
 
-    [ -d "$stage/ssh" ]    && cp -rp "$stage/ssh/." ~/.ssh/
-    [ -d "$stage/aws" ]    && cp -rp "$stage/aws/." ~/.aws/
-    [ -f "$stage/kube/config" ] && cp -p "$stage/kube/config" ~/.kube/config
-    [ -f "$stage/docker/config.json" ] && { mkdir -p ~/.docker; cp -p "$stage/docker/config.json" ~/.docker/config.json; }
-    [ -d "$stage/gnupg" ]  && cp -rp "$stage/gnupg/." ~/.gnupg/
-    [ -d "$stage/terraform.d" ] && { mkdir -p ~/.terraform.d; cp -rp "$stage/terraform.d/." ~/.terraform.d/; }
-    [ -f "$stage/zsh_secrets" ] && cp -p "$stage/zsh_secrets" ~/.zsh_secrets
-    [ -f "$stage/extra/tfc-github-key" ] && cp -p "$stage/extra/tfc-github-key" ~/tfc-github-key
-    [ -f "$stage/extra/tfc-github-key.pub" ] && cp -p "$stage/extra/tfc-github-key.pub" ~/tfc-github-key.pub
-    [ -f "$stage/extra/.terraformrc" ] && cp -p "$stage/extra/.terraformrc" ~/.terraformrc
+    # rsync -a --update em vez de cp: so toca o que e novo/diferente do que
+    # ja existe no disco, e nunca sobrescreve um arquivo local mais recente
+    # (ex: se voce ja tiver editado algo depois de um restore anterior).
+    # Isso torna o restore seguro de rodar mais de uma vez (idempotente).
+    [ -d "$stage/ssh" ]    && rsync -a --update "$stage/ssh/" ~/.ssh/
+    [ -d "$stage/aws" ]    && rsync -a --update "$stage/aws/" ~/.aws/
+    [ -f "$stage/kube/config" ] && rsync -a --update "$stage/kube/config" ~/.kube/config
+    [ -f "$stage/docker/config.json" ] && { mkdir -p ~/.docker; rsync -a --update "$stage/docker/config.json" ~/.docker/config.json; }
+    [ -d "$stage/gnupg" ]  && rsync -a --update "$stage/gnupg/" ~/.gnupg/
+    [ -d "$stage/terraform.d" ] && { mkdir -p ~/.terraform.d; rsync -a --update "$stage/terraform.d/" ~/.terraform.d/; }
+    [ -f "$stage/zsh_secrets" ] && rsync -a --update "$stage/zsh_secrets" ~/.zsh_secrets
+    [ -f "$stage/extra/tfc-github-key" ] && rsync -a --update "$stage/extra/tfc-github-key" ~/tfc-github-key
+    [ -f "$stage/extra/tfc-github-key.pub" ] && rsync -a --update "$stage/extra/tfc-github-key.pub" ~/tfc-github-key.pub
+    [ -f "$stage/extra/.terraformrc" ] && rsync -a --update "$stage/extra/.terraformrc" ~/.terraformrc
     if [ -f "$stage/gh/hosts.yml" ]; then
         mkdir -p ~/.config/gh
-        cp -p "$stage/gh/hosts.yml" ~/.config/gh/hosts.yml
+        rsync -a --update "$stage/gh/hosts.yml" ~/.config/gh/hosts.yml
         chmod 600 ~/.config/gh/hosts.yml
     fi
     if [ -d "$stage/dbeaver/DBeaverData" ]; then
         mkdir -p ~/.local/share
-        cp -rp "$stage/dbeaver/DBeaverData" ~/.local/share/DBeaverData
+        rsync -a --update "$stage/dbeaver/DBeaverData/" ~/.local/share/DBeaverData/
         info "✓ conexões do DBeaver restauradas"
     fi
     if [ -f "$stage/claude/.claude.json" ]; then
-        cp -p "$stage/claude/.claude.json" ~/.claude.json
+        rsync -a --update "$stage/claude/.claude.json" ~/.claude.json
         chmod 600 ~/.claude.json
     fi
     if [ -d "$stage/claude/dotclaude" ]; then
         mkdir -p ~/.claude
-        cp -rp "$stage/claude/dotclaude/." ~/.claude/
+        rsync -a --update "$stage/claude/dotclaude/" ~/.claude/
         chmod 600 ~/.claude/.credentials.json 2>/dev/null || true
         info "✓ Claude Code restaurado (histórico de conversas + credenciais)"
     fi
+    if [ -f "$stage/history/.zsh_history" ]; then
+        rsync -a --update "$stage/history/.zsh_history" ~/.zsh_history
+        chmod 600 ~/.zsh_history
+        info "✓ histórico do zsh restaurado"
+    fi
+    [ -f "$stage/history/.bash_history" ] && { rsync -a --update "$stage/history/.bash_history" ~/.bash_history; chmod 600 ~/.bash_history; }
     # Perfis openvpn3 so podem ser importados depois que o pacote "openvpn3"
     # estiver instalado (mais adiante no script), entao so guardamos os
     # arquivos .ovpn aqui num lugar persistente e importamos depois.
     if [ -d "$stage/openvpn3" ]; then
         mkdir -p ~/.cache/openvpn3-profiles-to-import
-        cp -rp "$stage/openvpn3/." ~/.cache/openvpn3-profiles-to-import/
+        rsync -a "$stage/openvpn3/" ~/.cache/openvpn3-profiles-to-import/
     fi
 
     # Permissões corretas
@@ -211,8 +285,20 @@ restore_secrets() {
     return 0
 }
 
+SECRETS_RESTORED=false
 if [ "$HAS_BACKUP" = true ]; then
-    run_step "restaurar segredos do backup" restore_secrets
+    if run_step "restaurar segredos do backup" restore_secrets; then
+        SECRETS_RESTORED=true
+    else
+        echo ""
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo "!! ATENÇÃO: os segredos (SSH/AWS/kube/docker/gnupg/terraform/ !!"
+        echo "!! DBeaver/VPN/Claude/histórico do zsh) NÃO foram restaurados !!"
+        echo "!! O script vai continuar instalando tudo, mas confira a      !!"
+        echo "!! seção de verificação final no fim deste log.               !!"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo ""
+    fi
 fi
 
 # Gerar chave SSH se, mesmo depois da restauração, nao existir nenhuma
@@ -264,7 +350,7 @@ run_step "plugin zsh-syntax-highlighting" install_zsh_plugin zsh-syntax-highligh
 # customizações, aliases e o source de ~/.zsh_secrets). So cai no template
 # generico abaixo se nao ha backup.
 if [ "$HAS_BACKUP" = true ] && [ -f "$BACKUP_DIR/dotfiles/.zshrc" ]; then
-    cp -p "$BACKUP_DIR/dotfiles/.zshrc" ~/.zshrc
+    rsync -a --update "$BACKUP_DIR/dotfiles/.zshrc" ~/.zshrc
     info "✅ .zshrc restaurado do backup (preferências originais preservadas)"
 else
 cat > ~/.zshrc << 'ZSHRC_EOF'
@@ -374,6 +460,24 @@ export NVM_DIR="$HOME/.nvm"
 export PATH="$HOME/.local/bin:$PATH"
 ZSHRC_EOF
     info "✅ .zshrc genérico criado (nenhum backup disponível)"
+fi
+
+# Restaura os DEMAIS dotfiles do backup (o .zshrc já foi tratado acima).
+# Lista explicita (nao glob "dotfiles/*"): todo arquivo aqui comeca com "."
+# e um glob "*" sem dotglob nao casaria com nenhum - mesma classe de bug
+# corrigida antes no "ls" do manifesto, aqui seria pior (silenciosamente
+# nao restauraria nada).
+if [ "$HAS_BACKUP" = true ] && [ -d "$BACKUP_DIR/dotfiles" ]; then
+    OUTROS_DOTFILES=(.bashrc .bash_profile .bash_aliases .profile .gitconfig .condarc .npmrc .vimrc .fzf.zsh .fzf.bash .zshrc.local)
+    for f in "${OUTROS_DOTFILES[@]}"; do
+        [ -f "$BACKUP_DIR/dotfiles/$f" ] && rsync -a --update "$BACKUP_DIR/dotfiles/$f" "$HOME/$f" && info "✓ $f restaurado"
+    done
+    if [ -f "$BACKUP_DIR/dotfiles/ssh_config" ]; then
+        mkdir -p ~/.ssh
+        rsync -a --update "$BACKUP_DIR/dotfiles/ssh_config" ~/.ssh/config
+        chmod 600 ~/.ssh/config
+        info "✓ ~/.ssh/config restaurado"
+    fi
 fi
 
 if [ "$SHELL" != "$(which zsh)" ]; then
@@ -750,7 +854,7 @@ fi
 
 if [ "$HAS_BACKUP" = true ] && [ -d "$BACKUP_DIR/inventory/vscode-user" ]; then
     mkdir -p ~/.config/Code/User
-    cp -rp "$BACKUP_DIR"/inventory/vscode-user/. ~/.config/Code/User/
+    rsync -a --update "$BACKUP_DIR"/inventory/vscode-user/ ~/.config/Code/User/
     info "✅ settings/keybindings/snippets do VS Code restaurados do backup"
 fi
 
@@ -926,6 +1030,71 @@ fi
 #==============================================================================
 if [ "$HAS_BACKUP" = true ] && [ -s "$BACKUP_DIR/inventory/crontab.txt" ]; then
     crontab "$BACKUP_DIR/inventory/crontab.txt" && info "✅ Crontab restaurado do backup"
+fi
+
+#==============================================================================
+# VERIFICAÇÃO FINAL - confere o que realmente foi restaurado no disco
+# (nao confia so no log de execucao - torna qualquer falha silenciosa visivel)
+#==============================================================================
+section "🔍 Verificação final do restore"
+
+VERIFY_FAILED=false
+check_item() {
+    local desc="$1" path="$2"
+    if [ -e "$path" ]; then
+        echo -e "  ${GREEN}✅${NC} $desc"
+    else
+        echo -e "  ${RED}❌${NC} $desc — não encontrado em $path"
+        VERIFY_FAILED=true
+    fi
+}
+
+if [ "$HAS_BACKUP" = true ]; then
+    ssh_key_count=$(find ~/.ssh -maxdepth 1 -type f ! -name "*.pub" ! -name "config" ! -name "known_hosts*" ! -name "authorized_keys" 2>/dev/null | wc -l)
+    if [ "$ssh_key_count" -gt 0 ]; then
+        echo -e "  ${GREEN}✅${NC} Chaves SSH privadas ($ssh_key_count encontrada(s))"
+    else
+        echo -e "  ${RED}❌${NC} Nenhuma chave SSH privada restaurada em ~/.ssh"
+        VERIFY_FAILED=true
+    fi
+    check_item "AWS config (~/.aws/config)"          ~/.aws/config
+    check_item "AWS credentials (~/.aws/credentials)" ~/.aws/credentials
+    check_item "kubeconfig (~/.kube/config)"          ~/.kube/config
+    check_item "Docker config (~/.docker/config.json)" ~/.docker/config.json
+    check_item "Segredos do zsh (~/.zsh_secrets)"     ~/.zsh_secrets
+    check_item "Histórico do zsh (~/.zsh_history)"    ~/.zsh_history
+    check_item "Conexões do DBeaver"                  ~/.local/share/DBeaverData
+    check_item "Config do Claude Code (~/.claude.json)" ~/.claude.json
+    check_item "Histórico de conversas do Claude Code" ~/.claude/projects
+    if command -v openvpn3 >/dev/null 2>&1 && [ -f "$BACKUP_DIR/secrets.tar.gpg" ]; then
+        if openvpn3 configs-list 2>/dev/null | tail -n +3 | grep -q .; then
+            echo -e "  ${GREEN}✅${NC} Perfil(is) VPN importado(s) no openvpn3"
+        else
+            echo -e "  ${YELLOW}⚠${NC}  Nenhum perfil VPN encontrado no openvpn3 (pode ser que você não tinha nenhum)"
+        fi
+    fi
+
+    if [ "$VERIFY_FAILED" = true ]; then
+        echo ""
+        error "############################################################"
+        error "# Um ou mais itens acima NÃO foram restaurados."
+        error "# Provável causa: senha errada (ou pulada) na etapa de"
+        error "# 'Restaurando segredos e credenciais', lá em cima neste log."
+        error "# RECUPERAÇÃO MANUAL (roda de novo, só isso, sem repetir o"
+        error "# resto do script):"
+        error "#"
+        error "#   mkdir -p /tmp/restore-secrets"
+        error "#   gpg -d $BACKUP_DIR/secrets.tar.gpg | tar -x -C /tmp/restore-secrets"
+        error "#   rsync -a --update /tmp/restore-secrets/aws/ ~/.aws/"
+        error "#   rsync -a --update /tmp/restore-secrets/ssh/  ~/.ssh/"
+        error "#   # (repita para kube/config, docker/config.json, gnupg,"
+        error "#   #  terraform.d, zsh_secrets, dbeaver, claude, history"
+        error "#   #  conforme o que faltar acima)"
+        error "#   rm -rf /tmp/restore-secrets"
+        error "############################################################"
+    else
+        info "✅ Todos os itens de segredos/dados críticos foram restaurados com sucesso"
+    fi
 fi
 
 #==============================================================================

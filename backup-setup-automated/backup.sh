@@ -55,6 +55,15 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERRO]${NC} $1"; }
 section() { echo ""; echo "=============================================="; echo "$1"; echo "=============================================="; }
 
+# Com "set -e", qualquer comando nao protegido que falhar mata o script sem
+# aviso claro (so o traceback cru do bash). Este trap garante uma mensagem
+# final inequivoca sempre que isso acontecer, apontando a linha exata.
+trap 'echo ""; echo "❌❌❌ BACKUP INTERROMPIDO na linha $LINENO. A pasta pode estar incompleta:"; echo "    ${BACKUP_DIR:-<ainda nao definida>}"; echo ""' ERR
+
+# Necessario para o prompt de senha do gpg funcionar de forma confiavel
+# quando chamado de dentro de um script.
+export GPG_TTY="$(tty 2>/dev/null || true)"
+
 mkdir -p "$BACKUP_DIR"/{dotfiles,inventory/conda,data}
 info "Backup sera criado em: $BACKUP_DIR"
 
@@ -107,8 +116,24 @@ copy_if_exists() {
     local src="$1" dst="$2"
     if [ -e "$src" ]; then
         mkdir -p "$(dirname "$SECRETS_STAGE/$dst")"
-        cp -rp "$src" "$SECRETS_STAGE/$dst"
-        secret_paths_found+=("$dst")
+        # rsync em vez de cp -rp: nao aborta o backup inteiro (sob set -e) se
+        # encontrar algo que nao da pra copiar (ex: socket do gpg-agent dentro
+        # de ~/.gnupg se ele estiver rodando na hora do backup) - so pula o
+        # que nao consegue e segue. O "if" tambem suspende o set -e para essa
+        # chamada especifica, entao uma falha aqui nunca mata o script todo.
+        if [ -d "$src" ]; then
+            if rsync -a "$src/" "$SECRETS_STAGE/$dst/" 2>/dev/null; then
+                secret_paths_found+=("$dst")
+            else
+                warn "Falha ao copiar '$src' para o bundle de segredos (pulando, backup continua)"
+            fi
+        else
+            if cp -p "$src" "$SECRETS_STAGE/$dst" 2>/dev/null; then
+                secret_paths_found+=("$dst")
+            else
+                warn "Falha ao copiar '$src' para o bundle de segredos (pulando, backup continua)"
+            fi
+        fi
     fi
 }
 
@@ -150,12 +175,22 @@ copy_if_exists "$HOME/.terraformrc"                "extra/.terraformrc"
 copy_if_exists "$HOME/.claude.json" "claude/.claude.json"
 if [ -d "$HOME/.claude" ]; then
     mkdir -p "$SECRETS_STAGE/claude/dotclaude"
-    rsync -a \
+    if rsync -a \
         --exclude cache/ --exclude downloads/ --exclude session-env/ \
         --exclude shell-snapshots/ --exclude file-history/ --exclude paste-cache/ \
-        "$HOME/.claude/" "$SECRETS_STAGE/claude/dotclaude/" 2>/dev/null
-    secret_paths_found+=("claude/dotclaude (historico de conversas + credenciais do Claude Code)")
+        "$HOME/.claude/" "$SECRETS_STAGE/claude/dotclaude/" 2>/dev/null; then
+        secret_paths_found+=("claude/dotclaude (historico de conversas + credenciais do Claude Code)")
+    else
+        warn "Falha ao copiar ~/.claude para o bundle de segredos (pulando, backup continua)"
+    fi
 fi
+
+# Historico do terminal. Vai no bundle criptografado (nao em dotfiles/ em
+# texto puro) porque comando digitado direto no terminal as vezes carrega
+# senha/token colado sem querer (ja aconteceu antes com VPN/API key deste
+# usuario em aliases).
+copy_if_exists "$HOME/.zsh_history"  "history/.zsh_history"
+copy_if_exists "$HOME/.bash_history" "history/.bash_history"
 
 if [ "${#secret_paths_found[@]}" -eq 0 ]; then
     warn "Nada encontrado para o bundle de segredos, pulando."
@@ -163,28 +198,38 @@ else
     info "Itens no bundle de segredos: ${secret_paths_found[*]}"
 
     TAR_PATH="$(mktemp -u).tar"
-    tar -C "$SECRETS_STAGE" -cf "$TAR_PATH" .
+    if ! tar -C "$SECRETS_STAGE" -cf "$TAR_PATH" .; then
+        error "Falha ao empacotar os segredos em tar. secrets.tar.gpg NÃO será criado."
+        error "O restante do backup (dotfiles, inventário, dados) ainda vai continuar."
+        rm -f "$TAR_PATH"
+        TAR_PATH=""
+    fi
 
-    info "Digite uma senha para criptografar o bundle de segredos (sera pedida de novo no restore)."
-    while true; do
-        read -r -s -p "Senha: " PASS1; echo
-        read -r -s -p "Confirme a senha: " PASS2; echo
-        if [ -z "$PASS1" ]; then
-            warn "Senha vazia nao e permitida."
-            continue
+    if [ -n "$TAR_PATH" ] && [ -f "$TAR_PATH" ]; then
+        info "Digite uma senha para criptografar o bundle de segredos (sera pedida de novo no restore)."
+        while true; do
+            read -r -s -p "Senha: " PASS1; echo
+            read -r -s -p "Confirme a senha: " PASS2; echo
+            if [ -z "$PASS1" ]; then
+                warn "Senha vazia nao e permitida."
+                continue
+            fi
+            if [ "$PASS1" = "$PASS2" ]; then
+                break
+            fi
+            warn "Senhas nao conferem, tente novamente."
+        done
+
+        if gpg --batch --yes --pinentry-mode loopback --passphrase "$PASS1" \
+            --symmetric --cipher-algo AES256 -o "$BACKUP_DIR/secrets.tar.gpg" "$TAR_PATH"; then
+            info "✅ secrets.tar.gpg criado (AES256, protegido por senha)"
+        else
+            error "Falha ao criptografar o bundle de segredos com gpg. secrets.tar.gpg NÃO foi criado."
+            error "O restante do backup ainda vai continuar."
         fi
-        if [ "$PASS1" = "$PASS2" ]; then
-            break
-        fi
-        warn "Senhas nao conferem, tente novamente."
-    done
-
-    gpg --batch --yes --pinentry-mode loopback --passphrase "$PASS1" \
-        --symmetric --cipher-algo AES256 -o "$BACKUP_DIR/secrets.tar.gpg" "$TAR_PATH"
-    unset PASS1 PASS2
-    shred -u "$TAR_PATH" 2>/dev/null || rm -f "$TAR_PATH"
-
-    info "✅ secrets.tar.gpg criado (AES256, protegido por senha)"
+        unset PASS1 PASS2
+        shred -u "$TAR_PATH" 2>/dev/null || rm -f "$TAR_PATH"
+    fi
     {
         echo "## Segredos (secrets.tar.gpg, criptografado AES256)"
         printf -- '- %s\n' "${secret_paths_found[@]}"
