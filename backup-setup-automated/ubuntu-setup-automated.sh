@@ -30,6 +30,13 @@ GIT_USER_NAME="Yuri Mussi"
 GIT_USER_EMAIL="ymussi@gmail.com"
 GIT_EDITOR="vi"
 
+# Tamanho do swap EM DISCO (/swap.img). A etapa "memória: zram + swap"
+# ajusta /swap.img para este tamanho se ele existir e estiver menor/diferente.
+# Formato aceito pelo fallocate (ex: 8G, 4G, 2048M). Se a máquina não tiver
+# /swap.img, a etapa NÃO cria um do zero (evita mexer em particionamento/fstab
+# de uma instalação que escolheu outro esquema de swap) - só loga e segue.
+SWAP_DISK_SIZE="${SWAP_DISK_SIZE:-8G}"
+
 # Token opcional do GitHub para levantar o rate limit da API (evita falhas
 # esporadicas ao resolver "latest release" de k9s/stern/lazygit). Nao e
 # obrigatorio.
@@ -524,6 +531,91 @@ if [ ! -d ~/.fzf ]; then
     info "✅ FZF instalado"
 else
     skip "FZF já instalado"
+fi
+
+#==============================================================================
+# MEMÓRIA: ZRAM + SWAP EM DISCO
+#==============================================================================
+# Replica a configuração aplicada na máquina principal em 03/11/2026:
+#   - zram (swap comprimido na RAM) via systemd-zram-generator, zram-size =
+#     metade da RAM, compressão zstd, prioridade alta (usado antes do disco);
+#   - /swap.img ajustado para $SWAP_DISK_SIZE (default 8G).
+# Idempotente: só instala/ajusta o que ainda não estiver no estado desejado.
+section "Configurando memória (zram + swap)"
+
+# --- zram via systemd-zram-generator ---
+if ! dpkg -l systemd-zram-generator 2>/dev/null | grep -q "^ii"; then
+    sudo apt-get install -y systemd-zram-generator >/dev/null 2>&1 \
+        && info "✅ systemd-zram-generator instalado" \
+        || warn "Falha ao instalar systemd-zram-generator"
+else
+    skip "systemd-zram-generator já instalado"
+fi
+
+# Conteúdo padrão do zram-generator.conf. Se o backup trouxer o arquivo real
+# da máquina de origem, usamos ele (preserva qualquer ajuste manual); senão
+# caímos neste template, que é exatamente o aplicado na máquina principal.
+ZRAM_CONF_DEST="/etc/systemd/zram-generator.conf"
+ZRAM_CONF_BACKUP=""
+[ "$HAS_BACKUP" = true ] && ZRAM_CONF_BACKUP="$BACKUP_DIR/inventory/zram-generator.conf"
+
+zram_conf_template() {
+    cat <<'ZRAM_EOF'
+[zram0]
+zram-size = ram / 2
+compression-algorithm = zstd
+swap-priority = 100
+ZRAM_EOF
+}
+
+# Monta o conteúdo desejado (backup tem prioridade sobre o template).
+ZRAM_WANT="$(mktemp)"
+if [ -n "$ZRAM_CONF_BACKUP" ] && [ -f "$ZRAM_CONF_BACKUP" ]; then
+    cp "$ZRAM_CONF_BACKUP" "$ZRAM_WANT"
+    info "Usando zram-generator.conf do backup"
+else
+    zram_conf_template > "$ZRAM_WANT"
+fi
+
+# Só reescreve + recarrega se o arquivo atual for diferente do desejado
+# (idempotência: rodar de novo não mexe em nada se já estiver igual).
+if ! sudo test -f "$ZRAM_CONF_DEST" || ! sudo cmp -s "$ZRAM_WANT" "$ZRAM_CONF_DEST"; then
+    sudo install -m 0644 "$ZRAM_WANT" "$ZRAM_CONF_DEST"
+    sudo systemctl daemon-reload
+    # start (não restart) para não derrubar um zram0 já em uso sem necessidade;
+    # o daemon-reload acima já faz o generator reprocessar a config.
+    sudo systemctl start systemd-zram-setup@zram0.service 2>/dev/null \
+        && info "✅ zram configurado e ativado ($ZRAM_CONF_DEST)" \
+        || warn "zram-generator.conf gravado, mas systemd-zram-setup@zram0 não subiu (verifique após reboot)"
+else
+    skip "zram-generator.conf já está no estado desejado"
+fi
+rm -f "$ZRAM_WANT"
+
+# --- /swap.img em disco ($SWAP_DISK_SIZE) ---
+# Só mexe se o arquivo JÁ existir (não criamos swap em disco do zero para não
+# alterar particionamento/fstab de uma instalação que escolheu outro esquema).
+if [ -f /swap.img ]; then
+    want_bytes="$(numfmt --from=iec "$SWAP_DISK_SIZE" 2>/dev/null || echo 0)"
+    have_bytes="$(sudo stat -c %s /swap.img 2>/dev/null || echo 0)"
+    if [ "$want_bytes" -gt 0 ] && [ "$have_bytes" != "$want_bytes" ]; then
+        info "Ajustando /swap.img de $(numfmt --to=iec "$have_bytes" 2>/dev/null || echo "$have_bytes") para $SWAP_DISK_SIZE ..."
+        sudo swapoff /swap.img 2>/dev/null || true
+        if sudo fallocate -l "$SWAP_DISK_SIZE" /swap.img; then
+            sudo chmod 600 /swap.img
+            sudo mkswap /swap.img >/dev/null
+            sudo swapon /swap.img \
+                && info "✅ /swap.img redimensionado para $SWAP_DISK_SIZE e reativado" \
+                || warn "/swap.img redimensionado, mas swapon falhou (confira a linha de swap no /etc/fstab)"
+        else
+            warn "fallocate falhou ao redimensionar /swap.img; tentando reativar o antigo"
+            sudo swapon /swap.img 2>/dev/null || true
+        fi
+    else
+        skip "/swap.img já está em $SWAP_DISK_SIZE"
+    fi
+else
+    skip "/swap.img não existe nesta máquina — não vou criar swap em disco do zero (só zram ativo)"
 fi
 
 #==============================================================================
@@ -1204,6 +1296,7 @@ echo "=============================================="
 echo ""
 echo "📦 Ferramentas instaladas:"
 echo "  ✓ Git, SSH keys, ZSH + Oh-My-Zsh + plugins"
+echo "  ✓ Memória: zram (systemd-zram-generator) + swap em disco ($SWAP_DISK_SIZE)"
 echo "  ✓ Miniconda + ambientes conda (restaurados ou genérico)"
 echo "  ✓ Node.js (via NVM) + pacotes npm globais"
 echo "  ✓ Docker + Docker Compose (plugin)"

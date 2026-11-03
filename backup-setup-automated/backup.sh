@@ -21,6 +21,7 @@
 #   secrets.tar.gpg  tar criptografado (AES256, senha) com ssh/aws/kube/docker/
 #                    gnupg/terraform.d/.zsh_secrets/VPNs (openvpn3 e NetworkManager)
 #   inventory/    listas de pacotes/extensoes/envs conda/versao node/dconf/crontab
+#                 e a config de memoria (zram-generator.conf)
 #   data/         Documents, Pictures, projects (e Downloads se pedido)
 #   MANIFEST.md   resumo humano do que foi incluido/excluido
 #
@@ -360,12 +361,21 @@ fi
 
 crontab -l > "$INV/crontab.txt" 2>/dev/null || true
 
+# Configuração de memória: zram-generator.conf (texto puro, sem segredo nem
+# dado pessoal). O setup usa este arquivo no lugar do template embutido quando
+# ele existir, preservando ajustes manuais de zram/swap.
+if [ -f /etc/systemd/zram-generator.conf ]; then
+    cp -p /etc/systemd/zram-generator.conf "$INV/zram-generator.conf" \
+        && info "✓ zram-generator.conf (configuração de memória/zram)"
+fi
+
 {
     echo "## Inventario"
     echo "- apt-manual.txt, snap-list.txt, npm-global.txt, vscode-extensions.txt"
     echo "- node-version.txt: $(cat "$INV/node-version.txt" 2>/dev/null || echo 'n/a')"
     echo "- conda/*.yml: $(ls "$INV/conda" 2>/dev/null | wc -l) ambiente(s)"
     echo "- gnome-dconf.txt, crontab.txt"
+    echo "- zram-generator.conf: $([ -f "$INV/zram-generator.conf" ] && echo 'incluido' || echo 'n/a')"
     echo ""
 } >> "$MANIFEST"
 
