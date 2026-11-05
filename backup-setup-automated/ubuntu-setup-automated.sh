@@ -9,6 +9,7 @@
 #   --restore CAMINHO   restaura o backup cifrado gerado pelo backup.sh.
 #                       CAMINHO e a pasta backup-ubuntu-<host>-<data> (ou o
 #                       backup.tar.gpg dentro dela). A senha e pedida na hora.
+#   --ignorar-sha256    segue o restore mesmo sem SHA256SUMS (por padrao a falta dele e erro).
 #   --auto-restore      procura backup-ubuntu-* em /media/$USER/* e usa o mais novo.
 #   --sem-harness       nao clona o dotfiles-claude nem roda o install.sh dele.
 #   --sem-displaylink   pula o driver DisplayLink (dock USB).
@@ -55,16 +56,17 @@ export DEBIAN_FRONTEND=noninteractive
 TMO() { timeout "$@"; }
 
 ETAPAS=(apt restore docker node uv gh aws terraform kubectl cli-extra kiro claude cli-ia rclone tailscale vpn apps displaylink zram playwright shell pacotes projetos harness)
-RESTORE_ARG=""; AUTO_RESTORE=false; SEM_PROJ=false
+RESTORE_ARG=""; AUTO_RESTORE=false; SEM_PROJ=false; IGNORA_SHA=false
 declare -A PULAR=() SO=()
 FALHAS=()
 
-uso() { sed -n '2,/^#====.*$/p' "$0" | sed -n '2,33p' | sed 's/^# \{0,1\}//'; }
+uso() { sed -n '2,/^#====.*$/p' "$0" | sed -n '2,34p' | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --restore) shift; RESTORE_ARG="${1:-}"; [ -n "$RESTORE_ARG" ] || { erro "--restore pede um caminho"; exit 2; } ;;
         --auto-restore) AUTO_RESTORE=true ;;
+        --ignorar-sha256) IGNORA_SHA=true ;;
         --sem-harness) PULAR[harness]=1 ;;
         --sem-displaylink) PULAR[displaylink]=1 ;;
         --sem-projetos) SEM_PROJ=true ;;
@@ -610,17 +612,29 @@ etapa_restore() {
     if [ -f "$dir/SHA256SUMS" ]; then
         info "conferindo sha256 do backup..."
         ( cd "$dir" && sha256sum -c SHA256SUMS >/dev/null ) || { erro "sha256 NAO confere: backup corrompido ou adulterado. Abortando o restore."; return 1; }
-    else warn "sem SHA256SUMS ao lado do backup; so a integridade interna do gpg sera conferida."; fi
+    elif $IGNORA_SHA; then warn "sem SHA256SUMS ao lado do backup; seguindo por causa de --ignorar-sha256 (so a integridade interna do gpg sera conferida)."
+    else erro "sem SHA256SUMS ao lado do backup: nao da para conferir a integridade. Copie o arquivo ou use --ignorar-sha256 se aceitar o risco."; return 1; fi
     [ -t 0 ] || { erro "preciso de um terminal para pedir a senha."; return 1; }
-    local PASS; read -rs -p "Senha do backup: " PASS; echo
-    info "extraindo para $HOME (arquivos que ja existem NAO sao sobrescritos)..."
-    local rc
+    local PASS; IFS= read -rs -p "Senha do backup: " PASS; echo
+    info "extraindo para $HOME (arquivos que ja existem NAO sao sobrescritos; os pulados sao listados)..."
+    local rc tarerr; tarerr="$(mktemp)"
     set +e
     gpg --batch --pinentry-mode loopback --passphrase-fd 3 -d "$arq" 3< <(printf '%s' "$PASS") 2>/dev/null \
-        | tar -x --skip-old-files --no-same-owner -C "$HOME"
+        | tar -x --keep-old-files --no-same-owner -C "$HOME" 2>"$tarerr"
     rc=("${PIPESTATUS[@]}")
     PASS=""
-    if [ "${rc[0]}" -ne 0 ] || [ "${rc[1]}" -ne 0 ]; then erro "falha ao decifrar/extrair (senha errada? gpg=${rc[0]} tar=${rc[1]})"; return 1; fi
+    # --keep-old-files avisa "Cannot open: File exists" por arquivo pulado e segue; qualquer outro erro e falha.
+    local pulados outros
+    pulados="$(sed -n 's/^tar: \(.*\): Cannot open: File exists$/\1/p' "$tarerr")"
+    outros="$(grep -v 'Cannot open: File exists$' "$tarerr" | grep -v '^tar: Exiting with failure status due to previous errors$' || true)"
+    rm -f "$tarerr"
+    if [ "${rc[0]}" -ne 0 ] || [ "${rc[1]}" -gt 2 ] || { [ "${rc[1]}" -ne 0 ] && [ -n "$outros" ]; }; then
+        erro "falha ao decifrar/extrair (senha errada? gpg=${rc[0]} tar=${rc[1]})"; [ -z "$outros" ] || printf '%s\n' "$outros" | head -10 >&2; return 1
+    fi
+    if [ -n "$pulados" ]; then
+        warn "$(printf '%s\n' "$pulados" | wc -l) arquivo(s) ja existiam e NAO foram sobrescritos (confira se o do backup deveria vencer; ex.: .gitconfig, .zshrc):"
+        printf '%s\n' "$pulados" | head -60 | sed 's/^/    ~\//' >&2
+    fi
     local meta="$HOME/$META"
     [ -d "$meta" ] || { erro "backup sem $META: nao foi gerado pelo backup.sh"; return 1; }
 
@@ -640,8 +654,9 @@ etapa_restore() {
             [ -f "$f" ] || continue
             local dst; dst="/etc/NetworkManager/system-connections/$(basename "$f")"
             [ -f "$dst" ] && { skip "VPN $(basename "$f")"; continue; }
-            if [ -n "$origem" ] && [ "$origem" != "$HOME" ]; then sed "s#$origem#$HOME#g" "$f" | sudo tee "$dst" >/dev/null; else sudo cp "$f" "$dst"; fi
-            sudo chown root:root "$dst"; sudo chmod 600 "$dst"
+            if [ -n "$origem" ] && [ "$origem" != "$HOME" ]; then
+                sed "s#$origem#$HOME#g" "$f" | sudo install -o root -g root -m 600 /dev/stdin "$dst"
+            else sudo install -o root -g root -m 600 "$f" "$dst"; fi
         done
         sudo nmcli connection reload 2>/dev/null || true
     fi
@@ -651,8 +666,13 @@ etapa_restore() {
         while IFS= read -r f; do
             rel="${f#"$raiz"}"
             case "$rel" in /etc/NetworkManager/system-connections/*|/etc/systemd/zram-generator.conf*|/etc/hosts) continue ;; esac
-            [ -e "$rel" ] && continue
-            sudo mkdir -p "$(dirname "$rel")" && sudo cp -a "$f" "$rel"
+            if [ -e "$rel" ]; then skip "/etc: $rel ja existe"; continue; fi
+            local modo=644
+            case "$rel" in /etc/sudoers.d/*) modo=440 ;; /etc/NetworkManager/*|/etc/openvpn/*|/etc/ssh/*|/etc/netplan/*) modo=600 ;; esac
+            if [ "$modo" = 440 ]; then
+                if ! sudo visudo -cf "$f" >/dev/null 2>&1; then warn "sudoers invalido no backup, NAO restaurado: $rel"; continue; fi
+            fi
+            sudo mkdir -p "$(dirname "$rel")" && sudo install -o root -g root -m "$modo" "$f" "$rel" || warn "nao restaurei $rel"
         done < <(find "$raiz/etc" -type f)
         info "hosts de origem em $raiz/etc/hosts (nao aplicado automaticamente; confira)."
         mkdir -p "$RESTORE_DIR" && cp -a "$raiz/etc/hosts" "$RESTORE_DIR/hosts.origem" 2>/dev/null || true

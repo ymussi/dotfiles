@@ -1,52 +1,50 @@
 #!/usr/bin/env bash
 #==============================================================================
-# backup.sh - backup completo e CIFRADO desta maquina Ubuntu para um disco
-# externo (ou qualquer pasta fora do repo).
+# backup.sh - backup completo e CIFRADO do HOME desta maquina Ubuntu para um
+# disco externo (ou qualquer pasta fora do repo).
 #
 # Uso:
-#   ./backup.sh DESTINO [--dry-run] [--projeto-max-mb N] [--rapido]
+#   ./backup.sh DESTINO [--dry-run] [--sem-sudo] [--rapido] [--excluir CAMINHO]...
+#   ./backup.sh --verificar PASTA_DO_BACKUP
 #
-#   DESTINO            pasta onde o backup sera criado (ex.: o disco externo
-#                      montado em /media/$USER/<disco>). Nunca um repo git.
-#   --dry-run          so lista o que entraria (MANIFESTO na tela). Nao pede
-#                      senha, nao usa sudo para copiar, nao grava nada.
-#   --projeto-max-mb N pasta de ~/projects fora do git so entra se tiver ate N
-#                      MB (padrao 2048).
-#   --ignorado-max-mb N arquivo/pasta ignorado pelo git (.env, .tfvars, .pem...) de um
-#                      repo so entra se tiver ate N MB (padrao 100); o que passar e contado.
+#   DESTINO            pasta onde o backup sera criado (ex.: o disco externo em
+#                      /media/$USER/<disco> ou /run/media/$USER/<disco>). Nunca um repo git.
+#                      Aceita ext4, exFAT e NTFS; recusa FAT32 (limite de 4 GB por arquivo).
+#   --dry-run          so lista o que entraria e o que fica de fora. Nao pede senha,
+#                      nao grava nada no destino.
 #   --sem-sudo         nao le /etc nem as VPNs do NetworkManager (sem pedir sudo).
 #   --rapido           pula o sha256 por arquivo do grupo "config e segredos"
 #                      (o sha256 do arquivo cifrado inteiro sempre e feito).
+#   --excluir CAMINHO  caminho (relativo ao HOME) a deixar de fora; repetivel.
+#   --verificar PASTA  confere SHA256SUMS, decifra e conta as entradas do tar,
+#                      comparando com o MANIFESTO. Rode depois de desmontar e
+#                      remontar o disco.
+#
+# O backup leva o HOME INTEIRO, menos a lista de exclusao (Downloads, cache regeneravel,
+# node_modules, venvs, .terraform...). Exclusoes so desta maquina: uma por linha (relativas
+# ao HOME, # comenta) em ~/.config/backup-ubuntu-excluir.txt, ou em BACKUP_EXCLUIR_FILE.
 #
 # Saida em DESTINO/backup-ubuntu-<host>-<data>/:
 #   backup.tar.gpg   tar cifrado (gpg simetrico AES256). A senha e pedida na
 #                    hora, duas vezes, e nunca e gravada em arquivo, argv ou log.
 #   SHA256SUMS       sha256 do backup.tar.gpg (sha256sum -c SHA256SUMS)
-#   MANIFESTO.txt    o que foi salvo (sem conteudo, so nomes/contagens/tamanhos)
+#   MANIFESTO.txt    o que foi salvo e o que ficou fora (sem conteudo)
 #
-# Dentro do tar, a pasta .backup-ubuntu-meta/ traz inventarios (pacotes,
-# crontab, units, dconf), copias dos arquivos de /etc que mudaram, perfis de VPN
-# do NetworkManager e o sha256 por arquivo. O ubuntu-setup-automated.sh --restore
-# le tudo isso.
-#
-# Extras: liste caminhos (relativos ao HOME) em ~/.config/backup-ubuntu-extras.txt, ou
-# aponte BACKUP_EXTRAS_FILE para outro arquivo. Assim nada especifico da sua conta fica no repo.
-#
-# NAO entram: ~/Downloads (decisao do dono), caches, node_modules, venvs,
-# ~/.aws/sso/cache, plugin-cache do terraform. Repos de ~/projects so entram se
-# tiverem mudanca nao enviada, ou nao estiverem no GitHub; os demais voltam por
-# git clone no restore.
+# Dentro do tar, .backup-ubuntu-meta/ traz inventarios (pacotes, crontab, units, dconf),
+# copias de /etc, perfis de VPN do NetworkManager e o sha256 por arquivo. O
+# ubuntu-setup-automated.sh --restore le tudo isso.
 #==============================================================================
+# shellcheck disable=SC2088
 set -euo pipefail
 umask 077
 
-VERSAO_SCRIPT="2026-11"
+VERSAO_SCRIPT="2026-11b"
 DRY_RUN=false
 RAPIDO=false
 SEM_SUDO=false
-PROJ_MAX_MB=2048
-IGN_MAX_MB=100
 DESTINO=""
+VERIFICAR=""
+EXCLUIR_ARGS=()
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC} $*" >&2; }
@@ -54,23 +52,56 @@ warn()  { echo -e "${YELLOW}[AVISO]${NC} $*" >&2; }
 erro()  { echo -e "${RED}[ERRO]${NC} $*" >&2; }
 die()   { erro "$*"; exit 1; }
 
-uso() { sed -n '2,/^#====.*$/p' "$0" | sed -n '2,40p' | sed 's/^# \{0,1\}//'; }
+uso() { sed -n '2,/^#====.*$/p' "$0" | sed -n '2,36p' | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=true ;;
         --rapido) RAPIDO=true ;;
         --sem-sudo) SEM_SUDO=true ;;
-        --ignorado-max-mb) shift; IGN_MAX_MB="${1:-}"; [[ "$IGN_MAX_MB" =~ ^[0-9]+$ ]] || die "--ignorado-max-mb pede um numero" ;;
-        --projeto-max-mb) shift; PROJ_MAX_MB="${1:-}"; [[ "$PROJ_MAX_MB" =~ ^[0-9]+$ ]] || die "--projeto-max-mb pede um numero" ;;
+        --excluir) shift; [ -n "${1:-}" ] || die "--excluir pede um caminho"; EXCLUIR_ARGS+=("$1") ;;
+        --verificar) shift; VERIFICAR="${1:-}"; [ -n "$VERIFICAR" ] || die "--verificar pede a pasta do backup" ;;
         -h|--help) uso; exit 0 ;;
         -*) die "opcao desconhecida: $1 (use --help)" ;;
         *) [ -z "$DESTINO" ] || die "so um DESTINO"; DESTINO="$1" ;;
     esac
     shift
 done
-[ -n "$DESTINO" ] || { uso; die "informe o DESTINO (ex.: /media/\$USER/<disco>)"; }
 [ "$(id -u)" -ne 0 ] || die "rode como o seu usuario, nao como root (o sudo e chamado so onde precisa)"
+
+#------------------------------------------------------------------------------
+# --verificar: sha256 do arquivo cifrado + decifra e conta entradas do tar
+#------------------------------------------------------------------------------
+if [ -n "$VERIFICAR" ]; then
+    for c in gpg tar sha256sum wc; do command -v "$c" >/dev/null 2>&1 || die "falta o comando: $c"; done
+    V="${VERIFICAR%/}"
+    [ -d "$V" ] || die "pasta nao existe: $V"
+    [ -f "$V/backup.tar.gpg" ] || die "sem backup.tar.gpg em $V"
+    [ -f "$V/SHA256SUMS" ] || die "sem SHA256SUMS em $V"
+    [ -f "$V/MANIFESTO.txt" ] || die "sem MANIFESTO.txt em $V"
+    info "1/2 sha256sum -c SHA256SUMS"
+    ( cd "$V" && sha256sum -c SHA256SUMS ) || die "sha256 NAO confere: arquivo corrompido."
+    ESPERADO="$(grep -m1 '^Entradas no tar:' "$V/MANIFESTO.txt" | grep -o '[0-9]*$' || true)"
+    [ -n "$ESPERADO" ] || die "MANIFESTO sem a linha 'Entradas no tar:'."
+    [ -t 0 ] || die "preciso de um terminal para pedir a senha."
+    IFS= read -rs -p "Senha do backup: " PASS; echo >&2
+    info "2/2 gpg -d | tar -tf - | wc -l (le o arquivo todo; pode levar bastante)"
+    LST="$(mktemp "${XDG_RUNTIME_DIR:-/dev/shm}/verifica.XXXXXX")"; trap 'rm -f "$LST"' EXIT
+    set +e
+    gpg --batch --pinentry-mode loopback --passphrase-fd 3 -d "$V/backup.tar.gpg" 3< <(printf '%s' "$PASS") 2>/dev/null | tar -tf - > "$LST"
+    RC=("${PIPESTATUS[@]}")
+    set -e
+    N="$(wc -l < "$LST" | tr -d ' ')"
+    PASS=""
+    [ "${RC[0]}" -eq 0 ] && [ "${RC[1]}" -eq 0 ] || die "falha ao decifrar/listar (senha errada? gpg=${RC[0]} tar=${RC[1]})."
+    if [ "$N" = "$ESPERADO" ]; then
+        info "OK: $N entradas no tar, igual ao MANIFESTO ($ESPERADO). Backup integro e abre com a senha."
+        exit 0
+    fi
+    die "entradas no tar ($N) diferente do MANIFESTO ($ESPERADO)."
+fi
+
+[ -n "$DESTINO" ] || { uso; die "informe o DESTINO (ex.: /media/\$USER/<disco>)"; }
 [ -d "$DESTINO" ] || die "DESTINO nao existe ou nao esta montado: $DESTINO"
 DESTINO="$(cd "$DESTINO" && pwd -P)"
 [ -w "$DESTINO" ] || die "sem permissao de escrita em $DESTINO"
@@ -87,6 +118,14 @@ for c in tar gpg sha256sum find du git; do
     command -v "$c" >/dev/null 2>&1 || die "falta o comando: $c"
 done
 
+FSTIPO="$(df --output=fstype "$DESTINO" | tail -1 | tr -d ' ')"
+case "$FSTIPO" in
+    vfat|msdos|fat|fat32) die "o disco de destino e FAT32 ($FSTIPO; limite de 4 GB por arquivo). Use NTFS, exFAT ou ext4." ;;
+    ntfs3|ntfs|ntfs-3g|fuseblk|exfat|ext4|ext3|ext2|xfs|btrfs) ;;
+    *) warn "sistema de arquivos do destino nao previsto: $FSTIPO (siga se aceitar arquivos de dezenas de GB)." ;;
+esac
+LIVRE="$(df -B1 --output=avail "$DESTINO" | tail -1 | tr -d ' ')"
+
 HOST="$(hostname -s 2>/dev/null || hostname)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 NOME="backup-ubuntu-${HOST}-${STAMP}"
@@ -97,204 +136,170 @@ META=".backup-ubuntu-meta"
 RUNBASE="${XDG_RUNTIME_DIR:-/dev/shm}"
 WORK="$(mktemp -d "$RUNBASE/backup-ubuntu.XXXXXX")"
 STAGE="$WORK/stage"
-mkdir -p "$STAGE/$META"
+mkdir -p "$STAGE/$META/inventario"
 LISTA="$WORK/lista.nul"
 LISTA_SHA="$WORK/lista-sha.nul"
-: > "$LISTA"
-: > "$LISTA_SHA"
-MAN="$WORK/manifesto.txt"
-: > "$MAN"
+: > "$LISTA"; : > "$LISTA_SHA"
+MAN="$WORK/manifesto.txt"; : > "$MAN"
+FORA="$WORK/fora.txt"; : > "$FORA"
 PASS=""
 cleanup() { PASS=""; rm -rf "$WORK"; }
 trap cleanup EXIT
 trap 'erro "falhou na linha $LINENO"' ERR
 
-#------------------------------------------------------------------------------
-# Excludes (padroes do tar; valem em qualquer profundidade)
-#------------------------------------------------------------------------------
-EXCL=(
-    '.aws/sso/cache' '.aws/cli/cache'
-    '.terraform.d/plugin-cache'
-    '.kiro/crew-venv' '.kiro/.crew-venv-*' '.kiro/crew-python' '.kiro/extensions' '.kiro/logs'
-    '.claude/cache' '.claude/shell-snapshots' '.claude/statsig' '.claude/telemetry'
-    '.local/share/jarvis/venv' '.local/share/jarvis/venv.bak*' '.local/share/voz/venv' '.local/share/voz/venv.bak*'
-    'node_modules' '__pycache__' '.venv' 'venv' '.terraform' '.pytest_cache' '.mypy_cache' '.nx'
-    '*.pyc'
-)
-TAR_EXCL=(); DU_EXCL=()
-for p in "${EXCL[@]}"; do
-    TAR_EXCL+=("--exclude=$p")
-    case "$p" in '*'*) DU_EXCL+=("--exclude=$p") ;; *) DU_EXCL+=("--exclude=*/$p") ;; esac
-done
-
-#------------------------------------------------------------------------------
-# Itens do HOME: grupo|caminho relativo ao HOME
-#------------------------------------------------------------------------------
-ITENS=(
-    'segredos|.ssh' 'segredos|.aws' 'segredos|.kube' 'segredos|.terraform.d'
-    'segredos|.config/rclone' 'segredos|.config/gh' 'segredos|.gnupg' 'segredos|.cert'
-    'segredos|.docker/config.json' 'segredos|.zsh_secrets' 'segredos|.claude.json'
-    'segredos|.local/share/kiro-cli/data.sqlite3' 'segredos|.local/share/keyrings'
-    'segredos|.gemini' 'segredos|.config/gcloud' 'segredos|.config/glab-cli' 'segredos|.config/hub'
-    'segredos|.config/kiro-cli' 'segredos|.config/google-chrome-cli' 'segredos|.netrc' 'segredos|.npmrc'
-    'segredos|.slack_secret' 'segredos|.config/xo-cli' 'segredos|.config/teamviewer'
-    'segredos|.local/share/GitKrakenCLI/gk.cfg' 'segredos|.config/GitKrakenCLI'
-    'segredos|.config/jarvis-polly' 'segredos|.config/helm' 'segredos|projects/OpenVPN'
-    'config|.zshrc' 'config|.zprofile' 'config|.bashrc' 'config|.bash_profile' 'config|.profile'
-    'config|.bash_aliases' 'config|.aliases' 'config|.tmux.conf' 'config|.gitconfig'
-    'config|.zsh_history' 'config|.config/monitors.xml' 'config|.config/mimeapps.list'
-    'config|.config/Code/User/settings.json' 'config|.config/Code/User/keybindings.json'
-    'config|.config/Code/User/snippets' 'config|.config/Kiro/User/settings.json'
-    'config|.config/Kiro/User/keybindings.json' 'config|.config/Kiro/User/snippets'
-    'config|.config/remmina' 'config|.config/autostart' 'config|.local/share/fonts' 'config|.fonts'
-    'config|.local/share/applications'
-    'harness|.kiro' 'harness|.kiro-shared' 'harness|.claude'
-    'harness|.local/share/jarvis' 'harness|.local/share/voz' 'harness|.local/share/escritorio'
-    'harness|.config/systemd/user'
-    'dados|Documentos' 'dados|Documents' 'dados|Pictures' 'dados|Desktop' 'dados|scratch'
-    'dados|backup-git-2026-11-05'
-)
-
-# Itens de topo que sao symlink (ex.: ~/.zsh_secrets -> repo do harness) viram copia
-# real em $META/deref/, porque o tar guardaria so o link.
-DEREF_LIST="$STAGE/$META/deref.txt"; : > "$DEREF_LIST"
-
 fmt_bytes() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
 mline() { printf '%s\n' "$*" >> "$MAN"; }
 
-# Conta so o que o tar levaria (respeita os excludes)
-conta_arquivos() {
-    tar -C "$HOME" "${TAR_EXCL[@]}" -cvf /dev/null "$1" 2>/dev/null | grep -vc '/$' || true
-}
+#------------------------------------------------------------------------------
+# Exclusoes
+#------------------------------------------------------------------------------
+# Ancoradas no HOME (caminho completo relativo ao HOME)
+EXCL_ANC=(
+    '.cache' '.local/share/Trash' '.npm' '.cargo/registry'
+    '.local/share/containers' '.local/share/docker'
+    'snap/*/common/.cache'
+    '.aws/sso/cache' '.aws/cli/cache' '.terraform.d/plugin-cache'
+    '.kiro/crew-venv' '.kiro/.crew-venv-*' '.kiro/crew-python' '.kiro/extensions' '.kiro/logs'
+    '.claude/cache' '.claude/shell-snapshots' '.claude/statsig' '.claude/telemetry'
+    '.local/share/jarvis/venv' '.local/share/jarvis/venv.bak*'
+    '.local/share/voz/venv*' '.local/share/voz/*/venv*'
+)
+# Em qualquer profundidade
+EXCL_ANY=(
+    'node_modules' '.terraform' '.venv' 'venv' '__pycache__' '.pytest_cache' '.mypy_cache' '*.pyc'
+    '.config/google-chrome/*/Cache' '.config/google-chrome/*/Code Cache'
+    '.config/google-chrome/*/Service Worker/CacheStorage'
+    '.mozilla/*/cache2'
+)
+# Topo do HOME que ficam de fora: Downloads (decisao do dono) + o arquivo local de exclusoes
+TOPO_FORA=('Downloads')
+EXCLUIR_FILE="${BACKUP_EXCLUIR_FILE:-$HOME/.config/backup-ubuntu-excluir.txt}"
+EXTRA_FORA=()
+if [ -f "$EXCLUIR_FILE" ]; then
+    while IFS= read -r linha; do
+        linha="${linha%%#*}"; linha="${linha//[$'\r']/}"; linha="${linha#"$HOME"/}"; linha="${linha#\~/}"; linha="${linha%/}"
+        [ -n "${linha// /}" ] || continue
+        EXTRA_FORA+=("$linha")
+    done < "$EXCLUIR_FILE"
+fi
+for a in "${EXCLUIR_ARGS[@]+"${EXCLUIR_ARGS[@]}"}"; do a="${a#"$HOME"/}"; a="${a%/}"; EXTRA_FORA+=("$a"); done
+for e in "${EXTRA_FORA[@]+"${EXTRA_FORA[@]}"}"; do
+    case "$e" in */*) EXCL_ANC+=("$e") ;; *) TOPO_FORA+=("$e") ;; esac
+done
 
-# Caminhos que ja estao no tar por outro item (evita duplicar projects/OpenVPN
-# quando a pasta entra por "projetos").
-declare -A JA=()
+TAR_EXCL=(--anchored)
+for p in "${EXCL_ANC[@]}"; do TAR_EXCL+=("--exclude=$p"); done
+TAR_EXCL+=(--no-anchored)
+for p in "${EXCL_ANY[@]}"; do TAR_EXCL+=("--exclude=$p"); done
+DU_EXCL=()
+for p in "${EXCL_ANC[@]}" "${EXCL_ANY[@]}"; do
+    case "$p" in '*'*) DU_EXCL+=("--exclude=$p") ;; *) DU_EXCL+=("--exclude=*/$p") ;; esac
+done
 
-adiciona_item() {
-    local grupo="$1" rel="$2" abs="$HOME/$2"
-    [ -e "$abs" ] || [ -L "$abs" ] || return 0
-    [ -z "${JA[$rel]:-}" ] || return 0
-    JA[$rel]=1
-    local bytes files
-    if [ -L "$abs" ]; then
-        local alvo; alvo="$(readlink -f "$abs" 2>/dev/null || true)"
-        [ -e "$alvo" ] || { warn "symlink quebrado, ignorado: ~/$rel"; return 0; }
-        bytes="$(du -sb "$alvo" 2>/dev/null | cut -f1)"; files="$(find "$alvo" -type f 2>/dev/null | wc -l)"
-        printf '%s\n' "$rel" >> "$DEREF_LIST"
-        mline "$grupo | ~/$rel (symlink, entra como copia real) | $files arquivos | $(fmt_bytes "${bytes:-0}")"
-        return 0
-    fi
-    bytes="$(du -sb "${DU_EXCL[@]}" "$abs" 2>/dev/null | cut -f1 || true)"
-    files="$(conta_arquivos "$rel")"
-    printf '%s\0' "$rel" >> "$LISTA"
-    case "$grupo" in segredos|config) printf '%s\0' "$rel" >> "$LISTA_SHA" ;; esac
-    mline "$grupo | ~/$rel | $files arquivos | $(fmt_bytes "${bytes:-0}")"
+eh_topo_fora() { local t; for t in "${TOPO_FORA[@]}"; do [ "$1" = "$t" ] && return 0; done; return 1; }
+
+#------------------------------------------------------------------------------
+# Itens: tudo no topo do HOME, menos a exclusao. Symlink de topo vira tambem copia real.
+#------------------------------------------------------------------------------
+DEREF_LIST="$STAGE/$META/deref.txt"; : > "$DEREF_LIST"
+ERROS_LEITURA="$WORK/erros.txt"; : > "$ERROS_LEITURA"
+EST=0
+
+monta_itens() {
+    local p rel bytes alvo
+    while IFS= read -r -d '' p; do
+        rel="${p#"$HOME"/}"
+        if eh_topo_fora "$rel"; then continue; fi
+        printf '%s\0' "$rel" >> "$LISTA"
+        case "$rel" in .ssh|.aws|.kube|.gnupg|.zsh*|.bash*|.profile|.zprofile|.gitconfig|.config|.cert|.docker|.netrc|.npmrc|.claude.json|.terraform.d)
+            printf '%s\0' "$rel" >> "$LISTA_SHA" ;; esac
+        if [ -L "$p" ]; then
+            alvo="$(readlink -f "$p" 2>/dev/null || true)"
+            if [ -e "$alvo" ]; then
+                bytes="$(du -sb "$alvo" 2>/dev/null | cut -f1 || echo 0)"; bytes="${bytes:-0}"
+                if [ "$bytes" -le 209715200 ]; then
+                    printf '%s\n' "$rel" >> "$DEREF_LIST"
+                    mline "~/$rel (symlink; entra o link e uma copia real) | $(fmt_bytes "$bytes")"
+                    EST=$((EST + bytes))
+                else
+                    printf 'symlink ~/%s aponta para %s (%s, grande demais para copiar: so o link entra)\n' "$rel" "$alvo" "$(fmt_bytes "$bytes")" >> "$ERROS_LEITURA"
+                fi
+            else
+                mline "~/$rel (symlink quebrado; so o link entra)"
+            fi
+            continue
+        fi
+        bytes="$(du -sb "${DU_EXCL[@]}" "$p" 2>>"$ERROS_LEITURA" | cut -f1 || true)"; bytes="${bytes:-0}"
+        EST=$((EST + bytes))
+        mline "~/$rel | $(fmt_bytes "$bytes")"
+    done < <(find "$HOME" -mindepth 1 -maxdepth 1 -print0 | sort -z)
 }
 
 #------------------------------------------------------------------------------
-# Projetos: so repos com mudanca nao enviada ou fora do GitHub; pastas fora do git
-# ate o limite de tamanho. Registra tambem a lista de clones para o restore.
+# Lista de repos de ~/projects (o setup reclona o que faltar; o conteudo ja vai inteiro no tar)
 #------------------------------------------------------------------------------
 CLONAR="$STAGE/$META/projetos-clonar.tsv"; : > "$CLONAR"
-PROJ_MAN="$WORK/projetos.txt"; : > "$PROJ_MAN"
-
-# Pasta fora do git entra se couber no limite; pasta que tem repos dentro e percorrida (arquivos soltos
-# e subpastas sem git entram; os repos seguem a regra de cima).
-IGN_LISTA="$STAGE/$META/inventario/gitignored-incluidos.txt"
-IGN_N=0; IGN_PULADOS=0; IGN_BYTES=0
-NAOGIT_N=0; NAOGIT_PULADOS=0
-
-tem_git_dentro() { find "$1" -maxdepth 6 -name .git -print -quit 2>/dev/null | grep -q .; }
-
-inclui_naogit() { # inclui_naogit caminho_absoluto
-    local d="$1" rel mb
-    rel="${d#"$HOME"/}"
-    [ -z "${JA[$rel]:-}" ] || return 0
-    mb=$(( $(du -sb "${DU_EXCL[@]}" "$d" 2>/dev/null | cut -f1 || echo 0) / 1048576 ))
-    if [ "$mb" -le "$PROJ_MAX_MB" ]; then
-        JA[$rel]=1; NAOGIT_N=$((NAOGIT_N+1))
-        printf '%s\0' "$rel" >> "$LISTA"
-        printf 'INCLUIDO | ~/%s | fora-do-git | %s MB\n' "$rel" "$mb" >> "$PROJ_MAN"
-    else
-        NAOGIT_PULADOS=$((NAOGIT_PULADOS+1))
-        printf 'IGNORADO (fora do git, %s MB > limite %s MB; use --projeto-max-mb) | ~/%s\n' "$mb" "$PROJ_MAX_MB" "$rel" >> "$PROJ_MAN"
-    fi
-}
-
-percorre_naogit() { # percorre_naogit dir profundidade
-    local dir="$1" nivel="$2" c
-    while IFS= read -r c; do
-        [ -n "$c" ] || continue
-        if [ -d "$c" ] && [ ! -L "$c" ]; then
-            if [ -e "$c/.git" ]; then continue
-            elif tem_git_dentro "$c"; then
-                if [ "$nivel" -lt 5 ]; then percorre_naogit "$c" $((nivel+1)); fi
-            else inclui_naogit "$c"; fi
-        elif [ -f "$c" ] || [ -L "$c" ]; then
-            [ "$nivel" -ge 1 ] || continue
-            local rel="${c#"$HOME"/}"
-            [ -z "${JA[$rel]:-}" ] || continue
-            JA[$rel]=1; printf '%s\0' "$rel" >> "$LISTA"
-        fi
-    done < <(find "$dir" -mindepth 1 -maxdepth 1 2>/dev/null | sort)
-}
-
-# Arquivos ignorados pelo git (.env, .tfvars, .pem...) de cada repo que NAO entra inteiro.
-# Fora: node_modules, .terraform, venv, .venv, __pycache__, dist, build, target. Entrada acima de
-# --ignorado-max-mb (padrao 100) e pulada e contada.
-coleta_ignorados() { # coleta_ignorados repo_absoluto
-    local d="$1" rel e abs sz
-    rel="${d#"$HOME"/}"
-    while IFS= read -r -d '' e; do
-        abs="$d/${e%/}"
-        sz="$(du -sb "${DU_EXCL[@]}" "$abs" 2>/dev/null | cut -f1 || echo 0)"; sz="${sz:-0}"
-        if [ "$sz" -gt $((IGN_MAX_MB * 1048576)) ]; then IGN_PULADOS=$((IGN_PULADOS+1)); continue; fi
-        printf '%s\0' "$rel/${e%/}" >> "$LISTA"
-        printf '%s/%s\n' "$rel" "${e%/}" >> "$IGN_LISTA"
-        IGN_N=$((IGN_N+1)); IGN_BYTES=$((IGN_BYTES+sz))
-    done < <(timeout 120 git -C "$d" ls-files -z --others --ignored --exclude-standard --directory 2>/dev/null \
-                | grep -zEv '(^|/)(node_modules|\.terraform|venv|\.venv|__pycache__|dist|build|target|\.pytest_cache|\.mypy_cache|\.nx|\.git)(/|$)' || true)
-}
-
-avalia_projetos() {
-    local base="$HOME/projects" d rel motivo url eh_wt dirty ahead
+lista_repos() {
+    local base="$HOME/projects" g d url rel n=0
     [ -d "$base" ] || return 0
-    mkdir -p "$(dirname "$IGN_LISTA")"; : > "$IGN_LISTA"
-    local -a repos=()
-    while IFS= read -r g; do repos+=("$(dirname "$g")"); done < <(find "$base" -maxdepth 6 -name .git -not -path '*/node_modules/*' 2>/dev/null | sort)
-    for d in "${repos[@]}"; do
-        rel="${d#"$HOME"/}"
-        eh_wt=false; [ -f "$d/.git" ] && eh_wt=true
-        motivo=""
+    while IFS= read -r g; do
+        d="$(dirname "$g")"
+        [ -d "$g" ] || continue
         url="$(timeout 20 git -C "$d" remote get-url origin 2>/dev/null || true)"
-        dirty="$(timeout 60 git -C "$d" status --porcelain 2>/dev/null | head -1 || true)"
-        ahead="$(timeout 60 git -C "$d" log --branches --not --remotes --oneline -1 2>/dev/null || true)"
-        if [ -n "$dirty" ]; then motivo="mudanca-local"
-        elif [ -n "$ahead" ] && ! $eh_wt; then motivo="commit-nao-enviado"
-        elif [ -z "$url" ] && ! $eh_wt; then motivo="sem-remoto"
-        elif [ -n "$url" ] && ! $eh_wt && ! printf '%s' "$url" | grep -q 'github\.com'; then motivo="fora-do-github"
-        fi
-        if [ -n "$motivo" ]; then
-            [ -z "${JA[$rel]:-}" ] || continue
-            JA[$rel]=1
-            local bytes files
-            bytes="$(du -sb "${DU_EXCL[@]}" "$d" 2>/dev/null | cut -f1 || true)"
-            files="$(conta_arquivos "$rel")"
-            printf '%s\0' "$rel" >> "$LISTA"
-            printf 'INCLUIDO | ~/%s | %s | %s arquivos | %s\n' "$rel" "$motivo" "$files" "$(fmt_bytes "${bytes:-0}")" >> "$PROJ_MAN"
-        else
-            if ! $eh_wt && [ -n "$url" ]; then
-                printf '%s\t%s\n' "$rel" "$url" >> "$CLONAR"
-                printf 'CLONAR NO SETUP | ~/%s\n' "$rel" >> "$PROJ_MAN"
-            else
-                printf 'IGNORADO (worktree limpo; a branch vive no repo principal) | ~/%s\n' "$rel" >> "$PROJ_MAN"
-            fi
-            coleta_ignorados "$d"
-        fi
+        [ -n "$url" ] || continue
+        rel="${d#"$HOME"/}"
+        printf '%s\t%s\n' "$rel" "$url" >> "$CLONAR"; n=$((n+1))
+    done < <(find "$base" -maxdepth 6 -name .git -not -path '*/node_modules/*' -not -path '*/.terraform/*' 2>/dev/null | sort)
+    mline "projetos | $n repositorios com remoto (lista para o setup reclonar se precisar; o conteudo entra inteiro)"
+}
+
+#------------------------------------------------------------------------------
+# FORA DO BACKUP: o que foi excluido, com tamanho
+#------------------------------------------------------------------------------
+fora_item() { # fora_item rotulo caminho...
+    local rot="$1" b=0 p; shift
+    local -a ex=()
+    for p in "$@"; do [ -e "$p" ] && ex+=("$p"); done
+    [ "${#ex[@]}" -gt 0 ] || return 0
+    b="$(du -sbc "${ex[@]}" 2>/dev/null | tail -1 | cut -f1 || true)"; b="${b:-0}"
+    printf '%s | %s\n' "$rot" "$(fmt_bytes "$b")" >> "$FORA"
+}
+
+calcula_fora() {
+    local t p
+    for t in "${TOPO_FORA[@]}"; do
+        if [ "$t" = Downloads ]; then fora_item "~/Downloads (decisao do dono)" "$HOME/Downloads"
+        else fora_item "~/$t (exclusao local desta maquina)" "$HOME/$t"; fi
     done
-    # Pastas e arquivos fora do git, em qualquer nivel (ate 5) de ~/projects
-    percorre_naogit "$base" 0
+    for p in "${EXCL_ANC[@]}"; do
+        case "$p" in
+            *'*'*) # padrao com curinga: expande so o que existe
+                local -a m=(); local f
+                shopt -s nullglob
+                for f in "$HOME"/$p; do m+=("$f"); done
+                shopt -u nullglob
+                if [ "${#m[@]}" -gt 0 ]; then fora_item "~/$p (cache/regeneravel)" "${m[@]}"; fi ;;
+            *) fora_item "~/$p (cache/regeneravel)" "$HOME/$p" ;;
+        esac
+    done
+    # Em qualquer profundidade: um find so, agrupado por nome
+    local bk="$WORK/fora-busca"; mkdir -p "$bk"
+    local -a prune=()
+    for t in "${TOPO_FORA[@]}"; do prune+=(-path "$HOME/$t" -o); done
+    for p in .cache .npm .local/share/Trash .local/share/containers .local/share/docker; do prune+=(-path "$HOME/$p" -o); done
+    prune+=(-path "$HOME/.cargo/registry")
+    while IFS= read -r -d '' p; do
+        printf '%s\0' "$p" >> "$bk/$(basename "$p")"
+    done < <(find "$HOME" \( "${prune[@]}" \) -prune -o -type d \( -name node_modules -o -name .terraform -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache -o -name .mypy_cache \) -prune -print0 2>/dev/null)
+    local f nome b
+    for f in "$bk"/*; do
+        [ -f "$f" ] || continue
+        nome="$(basename "$f")"
+        b="$(du -sbc --files0-from="$f" 2>/dev/null | tail -1 | cut -f1 || true)"; b="${b:-0}"
+        printf '**/%s (em qualquer pasta; .terraform.lock.hcl fica) | %s (%s pastas)\n' "$nome" "$(fmt_bytes "$b")" "$(tr -cd '\0' < "$f" | wc -c)" >> "$FORA"
+    done
+    fora_item "Cache do Chrome (Cache, Code Cache, Service Worker/CacheStorage)" "$HOME"/.config/google-chrome/*/Cache "$HOME"/.config/google-chrome/*/"Code Cache" "$HOME"/.config/google-chrome/*/"Service Worker"/CacheStorage
+    fora_item "Cache do Firefox (cache2)" "$HOME"/.mozilla/*/cache2 "$HOME"/.mozilla/firefox/*/cache2
 }
 
 #------------------------------------------------------------------------------
@@ -350,69 +355,68 @@ coleta_inventarios() {
     # units do usuario que NAO sao symlink (os symlinks para o repo do harness o install.sh recria)
     if [ -d "$HOME/.config/systemd/user" ]; then
         find "$HOME/.config/systemd/user" -maxdepth 2 -type f -printf '%P\n' 2>/dev/null > "$STAGE/$META/inventario/systemd-user-units-proprias.txt" || true
-        [ ! -s "$STAGE/$META/inventario/systemd-user-units-proprias.txt" ] && rm -f "$STAGE/$META/inventario/systemd-user-units-proprias.txt"
+        if [ ! -s "$STAGE/$META/inventario/systemd-user-units-proprias.txt" ]; then rm -f "$STAGE/$META/inventario/systemd-user-units-proprias.txt"; fi
     fi
 }
 
 #------------------------------------------------------------------------------
-# Arquivos do sistema (sudo): /etc mudados + perfis de VPN do NetworkManager
+# Arquivos do sistema (sudo): /etc + perfis de VPN do NetworkManager
 #------------------------------------------------------------------------------
 SUDO_OK=false
 prepara_sudo() {
     if $SEM_SUDO; then SUDO_OK=false; return 0; fi
     if $DRY_RUN; then
-        sudo -n true 2>/dev/null && SUDO_OK=true || SUDO_OK=false
+        if sudo -n true 2>/dev/null; then SUDO_OK=true; else SUDO_OK=false; fi
     else
-        info "Preciso do sudo para ler /etc (VPNs do NetworkManager, zram, DKMS)."
+        info "Preciso do sudo para ler /etc (VPNs do NetworkManager, zram, sudoers, apt, DKMS)."
         sudo -v || die "sudo negado; sem ele o backup perderia as VPNs do NetworkManager."
         SUDO_OK=true
     fi
 }
 
 ETC_FIXOS=(
-    /etc/systemd/zram-generator.conf /etc/systemd/zram-generator.conf.d
-    /etc/dkms /etc/docker/daemon.json /etc/hosts
     /etc/NetworkManager/system-connections /etc/NetworkManager/conf.d
-    /etc/openvpn /etc/netplan
+    /etc/systemd/zram-generator.conf /etc/systemd/zram-generator.conf.d
+    /etc/sudoers.d /etc/apt/sources.list.d /etc/apt/keyrings /etc/apt/trusted.gpg.d
+    /etc/dkms /etc/docker/daemon.json /etc/hosts /etc/openvpn /etc/netplan
 )
 ETC_NAO_PACOTE=(
-    /etc/modprobe.d /etc/modules-load.d /etc/sysctl.d /etc/udev/rules.d /etc/apt/sources.list.d
-    /etc/apt/preferences.d /etc/apt/apt.conf.d /etc/sudoers.d /etc/ssh/sshd_config.d
+    /etc/modprobe.d /etc/modules-load.d /etc/sysctl.d /etc/udev/rules.d
+    /etc/apt/preferences.d /etc/apt/apt.conf.d /etc/ssh/sshd_config.d
     /etc/security/limits.d /etc/systemd/system /etc/systemd/user /etc/systemd/logind.conf.d
 )
 
 coleta_sistema() {
     local dest="$STAGE/$META/raiz" p f n=0
     if ! $SUDO_OK; then
-        mline "sistema | /etc (zram, DKMS, NetworkManager, modprobe etc.) | NAO LISTADO (sem sudo: use sem --sem-sudo, ou rode "sudo -v" antes do --dry-run)"
+        mline "sistema | /etc (NetworkManager, zram, sudoers, apt, DKMS, modprobe...) | NAO LISTADO (sem sudo: rode sem --sem-sudo, ou 'sudo -v' antes do --dry-run)"
         return 0
     fi
     for p in "${ETC_FIXOS[@]}"; do
         sudo test -e "$p" || continue
         if $DRY_RUN; then
             n="$(sudo find "$p" -type f 2>/dev/null | wc -l)"
-            mline "sistema | $p | $n arquivos"
         else
             sudo mkdir -p "$dest$(dirname "$p")"
             sudo cp -a "$p" "$dest$(dirname "$p")/" 2>/dev/null || warn "nao copiei $p"
             n="$(sudo find "$dest$p" -type f 2>/dev/null | wc -l)"
-            mline "sistema | $p | $n arquivos"
         fi
+        mline "sistema | $p | $n arquivos"
     done
     for p in "${ETC_NAO_PACOTE[@]}"; do
         [ -d "$p" ] || continue
         n=0
         while IFS= read -r f; do
             # so o que nenhum pacote entrega (config da propria maquina)
-            dpkg -S "$f" >/dev/null 2>&1 && continue
-            [ -L "$f" ] && continue
+            if dpkg -S "$f" >/dev/null 2>&1; then continue; fi
+            if [ -L "$f" ]; then continue; fi
             n=$((n+1))
             if ! $DRY_RUN; then
                 sudo mkdir -p "$dest$(dirname "$f")"
                 sudo cp -a "$f" "$dest$f" 2>/dev/null || warn "nao copiei $f"
             fi
         done < <(sudo find "$p" -maxdepth 1 -type f 2>/dev/null | sort)
-        [ "$n" -eq 0 ] || mline "sistema | $p (so arquivos fora de pacote) | $n arquivos"
+        if [ "$n" -gt 0 ]; then mline "sistema | $p (so arquivos fora de pacote) | $n arquivos"; fi
     done
     if ! $DRY_RUN; then
         sudo chown -R "$(id -u):$(id -g)" "$dest" 2>/dev/null || true
@@ -423,77 +427,60 @@ coleta_sistema() {
 #------------------------------------------------------------------------------
 # Monta tudo
 #------------------------------------------------------------------------------
-info "Destino: $SAIDA"
-$DRY_RUN && info "Modo --dry-run: nada sera gravado."
+info "Destino: $SAIDA (fs: $FSTIPO, livre: $(fmt_bytes "$LIVRE"))"
+if $DRY_RUN; then info "Modo --dry-run: nada sera gravado."; fi
 
 prepara_sudo
-# Itens extras da sua maquina (credenciais de trabalho etc.), fora do repo: um caminho
-# relativo ao HOME por linha, opcionalmente "grupo|caminho"; # comenta.
-EXTRAS_FILE="${BACKUP_EXTRAS_FILE:-$HOME/.config/backup-ubuntu-extras.txt}"
-if [ -f "$EXTRAS_FILE" ]; then
-    while IFS= read -r linha; do
-        linha="${linha%%#*}"; linha="${linha//[$'\r']/}"; [ -n "${linha// /}" ] || continue
-        case "$linha" in *"|"*) ITENS+=("$linha") ;; *) ITENS+=("segredos|$linha") ;; esac
-    done < "$EXTRAS_FILE"
-fi
-for it in "${ITENS[@]}"; do adiciona_item "${it%%|*}" "${it#*|}"; done
-info "Avaliando ~/projects (git status em cada repo; pode levar alguns minutos)..."
-avalia_projetos
+info "Medindo o HOME (du por item; pode levar alguns minutos)..."
+monta_itens
+lista_repos
 coleta_inventarios
 coleta_sistema
-
-# Espaco: estimativa sobre o que vai para o tar
-EST=0
-while IFS= read -r -d '' rel; do
-    s="$(du -sb "${DU_EXCL[@]}" "$HOME/$rel" 2>/dev/null | cut -f1 || echo 0)"; EST=$((EST + ${s:-0}))
-done < "$LISTA"
-LIVRE="$(df -B1 --output=avail "$DESTINO" | tail -1 | tr -d ' ')"
-FSTIPO="$(df --output=fstype "$DESTINO" | tail -1 | tr -d ' ')"
-[ "$FSTIPO" != "vfat" ] || die "o disco de destino e FAT32 (limite de 4 GB por arquivo). Formate em exFAT ou ext4."
+info "Calculando o que fica FORA do backup..."
+calcula_fora
 
 monta_manifesto() {
-    local arq_info="${1:-}"
+    local arq_info="${1:-}" entradas="${2:-}"
     echo "MANIFESTO DO BACKUP - ubuntu ($NOME)"
     echo "Gerado em: $(date '+%Y-%m-%d %H:%M:%S %z')   script: backup.sh $VERSAO_SCRIPT"
     echo "Maquina: $HOST   usuario: $(id -un)   SO: $(. /etc/os-release; echo "$PRETTY_NAME")   kernel: $(uname -r)"
     echo "Modo: $($DRY_RUN && echo 'DRY-RUN (nada foi gravado)' || echo 'COMPLETO')"
     echo
-    echo "== Itens do HOME e sistema (grupo | caminho | arquivos | tamanho) =="
+    echo "== Itens do HOME (HOME inteiro menos a exclusao) e sistema =="
     cat "$MAN"
     echo
-    echo "== Projetos em ~/projects =="
-    echo "Regra: repo so entra inteiro se tiver mudanca nao enviada, commit nao enviado, sem remoto ou fora do GitHub (os outros so levam os arquivos ignorados pelo git);"
-    echo "os demais sao re-clonados no restore. Pasta fora do git entra ate ${PROJ_MAX_MB} MB."
-    sort "$PROJ_MAN"
-    echo "Resumo: $(grep -c '^INCLUIDO' "$PROJ_MAN" || true) incluidos, $(grep -c '^CLONAR' "$PROJ_MAN" || true) a clonar no setup, $(grep -c '^IGNORADO' "$PROJ_MAN" || true) ignorados"
-    echo "Pastas fora do git incluidas: $NAOGIT_N (puladas por tamanho: $NAOGIT_PULADOS)"
-    echo "Ignorados pelo git (.env, .tfvars, .pem etc., sem node_modules/.terraform/venv/dist/build/target): $IGN_N itens, $(fmt_bytes "$IGN_BYTES"); pulados por passar de ${IGN_MAX_MB} MB: $IGN_PULADOS"
-    echo
     echo "== Inventarios (dentro do tar, em $META/inventario/) =="
-    if [ -d "$STAGE/$META/inventario" ]; then
-        for f in "$STAGE/$META/inventario"/*; do
-            [ -f "$f" ] && printf '%s (%s linhas)\n' "$(basename "$f")" "$(wc -l < "$f")"
-        done
-    fi
+    local f
+    for f in "$STAGE/$META/inventario"/*; do
+        [ -f "$f" ] && printf '%s (%s linhas)\n' "$(basename "$f")" "$(wc -l < "$f")"
+    done
     echo
-    echo "== Fora do backup, de proposito =="
-    echo "Downloads do HOME (decisao do dono)"
-    echo "Padroes excluidos: ${EXCL[*]}"
+    echo "== FORA DO BACKUP (excluido de proposito, com tamanho) =="
+    sort "$FORA"
     echo "Nao salvo (refaz no setup): login do tailscale, login do gh/aws sso, chaves MOK do DKMS, token do Kiro se expirado."
     echo
     echo "== Tamanho =="
     echo "Dados a arquivar (sem compressao): $(fmt_bytes "$EST")   espaco livre no destino: $(fmt_bytes "$LIVRE")   fs: $FSTIPO"
+    [ -z "$entradas" ] || echo "Entradas no tar: $entradas"
     [ -z "$arq_info" ] || { echo; echo "== Arquivo =="; echo "$arq_info"; }
     echo
-    echo "== Restaurar =="
-    echo "sha256sum -c SHA256SUMS   (dentro desta pasta)"
+    echo "== Conferir e restaurar =="
+    echo "./backup.sh --verificar <esta pasta>   (depois de desmontar e remontar o disco)"
     echo "./ubuntu-setup-automated.sh --restore <esta pasta>   (pede a senha na hora)"
+}
+
+imprime_fora() {
+    echo
+    echo "=============== FORA DO BACKUP ==============="
+    sort "$FORA"
+    echo "=============================================="
 }
 
 if $DRY_RUN; then
     monta_manifesto
+    imprime_fora
     [ "$EST" -lt "$LIVRE" ] || warn "o destino tem menos espaco livre que o total a arquivar (sem contar compressao)."
-    info "Dry-run concluido. Nada foi gravado."
+    info "Total estimado a arquivar (sem compressao): $(fmt_bytes "$EST"). Dry-run concluido. Nada foi gravado."
     exit 0
 fi
 
@@ -506,21 +493,21 @@ mkdir -p "$STAGE/$META/deref"
 while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     mkdir -p "$STAGE/$META/deref/$(dirname "$rel")"
-    cp -aL "$HOME/$rel" "$STAGE/$META/deref/$rel"
+    cp -aL "$HOME/$rel" "$STAGE/$META/deref/$rel" || printf 'nao copiei o alvo do symlink ~/%s\n' "$rel" >> "$ERROS_LEITURA"
 done < "$DEREF_LIST"
 
 if ! $RAPIDO; then
     info "Calculando sha256 por arquivo (config e segredos)..."
     tar --null "${TAR_EXCL[@]}" -C "$HOME" -T "$LISTA_SHA" -cvf /dev/null 2>/dev/null \
-        | grep -v '/$' | tr '\n' '\0' | (cd "$HOME" && xargs -0 -r -n50 sha256sum 2>/dev/null) \
+        | grep -v '/$' | tr '\n' '\0' | (cd "$HOME" && xargs -0 -r -n50 sha256sum 2>>"$ERROS_LEITURA") \
         > "$STAGE/$META/SHA256-ARQUIVOS.txt" || true
 fi
 
 cp "$0" "$STAGE/$META/backup.sh.usado" 2>/dev/null || true
 
 if [ ! -t 0 ]; then die "preciso de um terminal para pedir a senha."; fi
-read -rs -p "Senha do backup (nao sera gravada): " PASS; echo >&2
-read -rs -p "Repita a senha: " PASS2; echo >&2
+IFS= read -rs -p "Senha do backup (nao sera gravada): " PASS; echo >&2
+IFS= read -rs -p "Repita a senha: " PASS2; echo >&2
 [ "$PASS" = "$PASS2" ] || die "as senhas nao conferem."
 PASS2=""
 [ "${#PASS}" -ge 10 ] || die "use uma senha com pelo menos 10 caracteres (o arquivo leva chaves e tokens)."
@@ -530,32 +517,50 @@ PASS2=""
 #------------------------------------------------------------------------------
 mkdir -p "$SAIDA.parcial"
 ALVO="$SAIDA.parcial/backup.tar.gpg"
-info "Arquivando e cifrando (pode levar bastante; ~$(fmt_bytes "$EST"))..."
+INDICE="$WORK/indice.txt"
+info "Arquivando e cifrando (pode levar bastante; ~$(fmt_bytes "$EST") sem compressao)..."
 
+# Sem --ignore-failed-read: arquivo ilegivel vira erro listado no fim (tar rc 2), nunca silencio.
+trap - ERR
 set +e
-tar --null --warning=no-file-changed --warning=no-file-ignored --ignore-failed-read \
+tar --null --warning=no-file-changed --warning=no-file-ignored --index-file="$INDICE" -v \
     "${TAR_EXCL[@]}" -cf - -C "$HOME" -T "$LISTA" -C "$STAGE" "$META" 2>"$WORK/tar.err" \
   | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --symmetric \
         --cipher-algo AES256 --s2k-mode 3 --s2k-digest-algo SHA512 --s2k-count 65011712 \
         -z 1 -o "$ALVO" 3< <(printf '%s' "$PASS") 2>"$WORK/gpg.err"
 RC=("${PIPESTATUS[@]}")
 set -e
+trap 'erro "falhou na linha $LINENO"' ERR
 PASS=""
-if [ "${RC[0]}" -gt 1 ] || [ "${RC[1]}" -ne 0 ]; then
+if [ "${RC[0]}" -gt 2 ] || [ "${RC[1]}" -ne 0 ]; then
     erro "tar rc=${RC[0]} gpg rc=${RC[1]}"; tail -5 "$WORK/tar.err" "$WORK/gpg.err" >&2 || true
     rm -rf "$SAIDA.parcial"; exit 1
 fi
-[ "${RC[0]}" -eq 0 ] || warn "tar terminou com aviso (arquivo mudou durante a leitura, normal em ~/.claude); backup valido."
+if [ "${RC[0]}" -ne 0 ] && [ -s "$WORK/tar.err" ]; then cat "$WORK/tar.err" >> "$ERROS_LEITURA"; fi
+ENTRADAS="$(wc -l < "$INDICE" | tr -d ' ')"
 
 info "Calculando sha256 do arquivo cifrado..."
 ( cd "$SAIDA.parcial" && sha256sum backup.tar.gpg > SHA256SUMS )
 TAM="$(stat -c %s "$ALVO")"
 SHA="$(cut -d' ' -f1 "$SAIDA.parcial/SHA256SUMS")"
-monta_manifesto "backup.tar.gpg | $(fmt_bytes "$TAM") | sha256 $SHA | cifrado gpg simetrico AES256" > "$SAIDA.parcial/MANIFESTO.txt"
+{
+    monta_manifesto "backup.tar.gpg | $(fmt_bytes "$TAM") | sha256 $SHA | cifrado gpg simetrico AES256" "$ENTRADAS"
+    if [ -s "$ERROS_LEITURA" ]; then echo; echo "== ERROS DE LEITURA (nao entraram) =="; cat "$ERROS_LEITURA"; fi
+} > "$SAIDA.parcial/MANIFESTO.txt"
 sync
 mv "$SAIDA.parcial" "$SAIDA"
 
 info "Conferindo o sha256 gravado..."
 ( cd "$SAIDA" && sha256sum -c SHA256SUMS >&2 )
-info "Pronto: $SAIDA"
+
+imprime_fora
+if [ -s "$ERROS_LEITURA" ]; then
+    echo
+    erro "ERROS DE LEITURA (o backup foi gravado, mas estes itens NAO entraram):"
+    cat "$ERROS_LEITURA" >&2
+    erro "Corrija (permissao/dono) e rode de novo antes de apagar a maquina. Saida: $SAIDA"
+    exit 1
+fi
+info "Pronto: $SAIDA  ($ENTRADAS entradas no tar, $(fmt_bytes "$TAM"))"
+info "Depois de desmontar e remontar o disco: ./backup.sh --verificar $SAIDA"
 info "Guarde a senha fora deste computador. Sem ela o backup nao abre."
