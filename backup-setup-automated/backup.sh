@@ -11,7 +11,9 @@
 #   --dry-run          so lista o que entraria (MANIFESTO na tela). Nao pede
 #                      senha, nao usa sudo para copiar, nao grava nada.
 #   --projeto-max-mb N pasta de ~/projects fora do git so entra se tiver ate N
-#                      MB (padrao 500).
+#                      MB (padrao 2048).
+#   --ignorado-max-mb N arquivo/pasta ignorado pelo git (.env, .tfvars, .pem...) de um
+#                      repo so entra se tiver ate N MB (padrao 100); o que passar e contado.
 #   --sem-sudo         nao le /etc nem as VPNs do NetworkManager (sem pedir sudo).
 #   --rapido           pula o sha256 por arquivo do grupo "config e segredos"
 #                      (o sha256 do arquivo cifrado inteiro sempre e feito).
@@ -42,7 +44,8 @@ VERSAO_SCRIPT="2026-11"
 DRY_RUN=false
 RAPIDO=false
 SEM_SUDO=false
-PROJ_MAX_MB=500
+PROJ_MAX_MB=2048
+IGN_MAX_MB=100
 DESTINO=""
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -51,13 +54,14 @@ warn()  { echo -e "${YELLOW}[AVISO]${NC} $*" >&2; }
 erro()  { echo -e "${RED}[ERRO]${NC} $*" >&2; }
 die()   { erro "$*"; exit 1; }
 
-uso() { sed -n '2,/^#====.*$/p' "$0" | sed -n '2,38p' | sed 's/^# \{0,1\}//'; }
+uso() { sed -n '2,/^#====.*$/p' "$0" | sed -n '2,40p' | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=true ;;
         --rapido) RAPIDO=true ;;
         --sem-sudo) SEM_SUDO=true ;;
+        --ignorado-max-mb) shift; IGN_MAX_MB="${1:-}"; [[ "$IGN_MAX_MB" =~ ^[0-9]+$ ]] || die "--ignorado-max-mb pede um numero" ;;
         --projeto-max-mb) shift; PROJ_MAX_MB="${1:-}"; [[ "$PROJ_MAX_MB" =~ ^[0-9]+$ ]] || die "--projeto-max-mb pede um numero" ;;
         -h|--help) uso; exit 0 ;;
         -*) die "opcao desconhecida: $1 (use --help)" ;;
@@ -113,8 +117,8 @@ EXCL=(
     '.terraform.d/plugin-cache'
     '.kiro/crew-venv' '.kiro/.crew-venv-*' '.kiro/crew-python' '.kiro/extensions' '.kiro/logs'
     '.claude/cache' '.claude/shell-snapshots' '.claude/statsig' '.claude/telemetry'
-    '.local/share/jarvis/venv' '.local/share/jarvis/venv.bak*'
-    'node_modules' '__pycache__' '.venv' '.terraform' '.pytest_cache' '.mypy_cache' '.nx'
+    '.local/share/jarvis/venv' '.local/share/jarvis/venv.bak*' '.local/share/voz/venv' '.local/share/voz/venv.bak*'
+    'node_modules' '__pycache__' '.venv' 'venv' '.terraform' '.pytest_cache' '.mypy_cache' '.nx'
     '*.pyc'
 )
 TAR_EXCL=(); DU_EXCL=()
@@ -130,7 +134,11 @@ ITENS=(
     'segredos|.ssh' 'segredos|.aws' 'segredos|.kube' 'segredos|.terraform.d'
     'segredos|.config/rclone' 'segredos|.config/gh' 'segredos|.gnupg' 'segredos|.cert'
     'segredos|.docker/config.json' 'segredos|.zsh_secrets' 'segredos|.claude.json'
-    'segredos|.local/share/kiro-cli/data.sqlite3'
+    'segredos|.local/share/kiro-cli/data.sqlite3' 'segredos|.local/share/keyrings'
+    'segredos|.gemini' 'segredos|.config/gcloud' 'segredos|.config/glab-cli' 'segredos|.config/hub'
+    'segredos|.config/kiro-cli' 'segredos|.config/google-chrome-cli' 'segredos|.netrc' 'segredos|.npmrc'
+    'segredos|.slack_secret' 'segredos|.config/xo-cli' 'segredos|.config/teamviewer'
+    'segredos|.local/share/GitKrakenCLI/gk.cfg' 'segredos|.config/GitKrakenCLI'
     'segredos|.config/jarvis-polly' 'segredos|.config/helm' 'segredos|projects/OpenVPN'
     'config|.zshrc' 'config|.zprofile' 'config|.bashrc' 'config|.bash_profile' 'config|.profile'
     'config|.bash_aliases' 'config|.aliases' 'config|.tmux.conf' 'config|.gitconfig'
@@ -138,10 +146,13 @@ ITENS=(
     'config|.config/Code/User/settings.json' 'config|.config/Code/User/keybindings.json'
     'config|.config/Code/User/snippets' 'config|.config/Kiro/User/settings.json'
     'config|.config/Kiro/User/keybindings.json' 'config|.config/Kiro/User/snippets'
-    'config|.config/remmina' 'config|.config/autostart'
+    'config|.config/remmina' 'config|.config/autostart' 'config|.local/share/fonts' 'config|.fonts'
+    'config|.local/share/applications'
     'harness|.kiro' 'harness|.kiro-shared' 'harness|.claude'
-    'harness|.local/share/jarvis'
-    'dados|Documentos' 'dados|Documents' 'dados|Pictures'
+    'harness|.local/share/jarvis' 'harness|.local/share/voz' 'harness|.local/share/escritorio'
+    'harness|.config/systemd/user'
+    'dados|Documentos' 'dados|Documents' 'dados|Pictures' 'dados|Desktop' 'dados|scratch'
+    'dados|backup-git-2026-11-05'
 )
 
 # Itens de topo que sao symlink (ex.: ~/.zsh_secrets -> repo do harness) viram copia
@@ -188,11 +199,70 @@ adiciona_item() {
 CLONAR="$STAGE/$META/projetos-clonar.tsv"; : > "$CLONAR"
 PROJ_MAN="$WORK/projetos.txt"; : > "$PROJ_MAN"
 
+# Pasta fora do git entra se couber no limite; pasta que tem repos dentro e percorrida (arquivos soltos
+# e subpastas sem git entram; os repos seguem a regra de cima).
+IGN_LISTA="$STAGE/$META/inventario/gitignored-incluidos.txt"
+IGN_N=0; IGN_PULADOS=0; IGN_BYTES=0
+NAOGIT_N=0; NAOGIT_PULADOS=0
+
+tem_git_dentro() { find "$1" -maxdepth 6 -name .git -print -quit 2>/dev/null | grep -q .; }
+
+inclui_naogit() { # inclui_naogit caminho_absoluto
+    local d="$1" rel mb
+    rel="${d#"$HOME"/}"
+    [ -z "${JA[$rel]:-}" ] || return 0
+    mb=$(( $(du -sb "${DU_EXCL[@]}" "$d" 2>/dev/null | cut -f1 || echo 0) / 1048576 ))
+    if [ "$mb" -le "$PROJ_MAX_MB" ]; then
+        JA[$rel]=1; NAOGIT_N=$((NAOGIT_N+1))
+        printf '%s\0' "$rel" >> "$LISTA"
+        printf 'INCLUIDO | ~/%s | fora-do-git | %s MB\n' "$rel" "$mb" >> "$PROJ_MAN"
+    else
+        NAOGIT_PULADOS=$((NAOGIT_PULADOS+1))
+        printf 'IGNORADO (fora do git, %s MB > limite %s MB; use --projeto-max-mb) | ~/%s\n' "$mb" "$PROJ_MAX_MB" "$rel" >> "$PROJ_MAN"
+    fi
+}
+
+percorre_naogit() { # percorre_naogit dir profundidade
+    local dir="$1" nivel="$2" c
+    while IFS= read -r c; do
+        [ -n "$c" ] || continue
+        if [ -d "$c" ] && [ ! -L "$c" ]; then
+            if [ -e "$c/.git" ]; then continue
+            elif tem_git_dentro "$c"; then
+                if [ "$nivel" -lt 5 ]; then percorre_naogit "$c" $((nivel+1)); fi
+            else inclui_naogit "$c"; fi
+        elif [ -f "$c" ] || [ -L "$c" ]; then
+            [ "$nivel" -ge 1 ] || continue
+            local rel="${c#"$HOME"/}"
+            [ -z "${JA[$rel]:-}" ] || continue
+            JA[$rel]=1; printf '%s\0' "$rel" >> "$LISTA"
+        fi
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 2>/dev/null | sort)
+}
+
+# Arquivos ignorados pelo git (.env, .tfvars, .pem...) de cada repo que NAO entra inteiro.
+# Fora: node_modules, .terraform, venv, .venv, __pycache__, dist, build, target. Entrada acima de
+# --ignorado-max-mb (padrao 100) e pulada e contada.
+coleta_ignorados() { # coleta_ignorados repo_absoluto
+    local d="$1" rel e abs sz
+    rel="${d#"$HOME"/}"
+    while IFS= read -r -d '' e; do
+        abs="$d/${e%/}"
+        sz="$(du -sb "${DU_EXCL[@]}" "$abs" 2>/dev/null | cut -f1 || echo 0)"; sz="${sz:-0}"
+        if [ "$sz" -gt $((IGN_MAX_MB * 1048576)) ]; then IGN_PULADOS=$((IGN_PULADOS+1)); continue; fi
+        printf '%s\0' "$rel/${e%/}" >> "$LISTA"
+        printf '%s/%s\n' "$rel" "${e%/}" >> "$IGN_LISTA"
+        IGN_N=$((IGN_N+1)); IGN_BYTES=$((IGN_BYTES+sz))
+    done < <(timeout 120 git -C "$d" ls-files -z --others --ignored --exclude-standard --directory 2>/dev/null \
+                | grep -zEv '(^|/)(node_modules|\.terraform|venv|\.venv|__pycache__|dist|build|target|\.pytest_cache|\.mypy_cache|\.nx|\.git)(/|$)' || true)
+}
+
 avalia_projetos() {
     local base="$HOME/projects" d rel motivo url eh_wt dirty ahead
     [ -d "$base" ] || return 0
+    mkdir -p "$(dirname "$IGN_LISTA")"; : > "$IGN_LISTA"
     local -a repos=()
-    while IFS= read -r g; do repos+=("$(dirname "$g")"); done < <(find "$base" -maxdepth 4 -name .git -not -path '*/node_modules/*' 2>/dev/null | sort)
+    while IFS= read -r g; do repos+=("$(dirname "$g")"); done < <(find "$base" -maxdepth 6 -name .git -not -path '*/node_modules/*' 2>/dev/null | sort)
     for d in "${repos[@]}"; do
         rel="${d#"$HOME"/}"
         eh_wt=false; [ -f "$d/.git" ] && eh_wt=true
@@ -213,29 +283,18 @@ avalia_projetos() {
             files="$(conta_arquivos "$rel")"
             printf '%s\0' "$rel" >> "$LISTA"
             printf 'INCLUIDO | ~/%s | %s | %s arquivos | %s\n' "$rel" "$motivo" "$files" "$(fmt_bytes "${bytes:-0}")" >> "$PROJ_MAN"
-        elif ! $eh_wt && [ -n "$url" ]; then
-            printf '%s\t%s\n' "$rel" "$url" >> "$CLONAR"
-            printf 'CLONAR NO SETUP | ~/%s\n' "$rel" >> "$PROJ_MAN"
         else
-            printf 'IGNORADO (worktree limpo; a branch vive no repo principal) | ~/%s\n' "$rel" >> "$PROJ_MAN"
+            if ! $eh_wt && [ -n "$url" ]; then
+                printf '%s\t%s\n' "$rel" "$url" >> "$CLONAR"
+                printf 'CLONAR NO SETUP | ~/%s\n' "$rel" >> "$PROJ_MAN"
+            else
+                printf 'IGNORADO (worktree limpo; a branch vive no repo principal) | ~/%s\n' "$rel" >> "$PROJ_MAN"
+            fi
+            coleta_ignorados "$d"
         fi
     done
-    # Pastas de ~/projects sem nenhum .git dentro (ate 4 niveis)
-    for d in "$base"/*/; do
-        d="${d%/}"; rel="projects/$(basename "$d")"
-        [ -z "${JA[$rel]:-}" ] || continue
-        if [ -d "$d/.git" ] || [ -f "$d/.git" ]; then continue; fi
-        if find "$d" -maxdepth 4 -name .git -print -quit 2>/dev/null | grep -q .; then continue; fi
-        local mb
-        mb=$(( $(du -sb "${DU_EXCL[@]}" "$d" 2>/dev/null | cut -f1 || echo 0) / 1048576 ))
-        if [ "$mb" -le "$PROJ_MAX_MB" ]; then
-            JA[$rel]=1
-            printf '%s\0' "$rel" >> "$LISTA"
-            printf 'INCLUIDO | ~/%s | fora-do-git | %s MB\n' "$rel" "$mb" >> "$PROJ_MAN"
-        else
-            printf 'IGNORADO (fora do git, %s MB > limite %s MB) | ~/%s\n' "$mb" "$PROJ_MAX_MB" "$rel" >> "$PROJ_MAN"
-        fi
-    done
+    # Pastas e arquivos fora do git, em qualquer nivel (ate 5) de ~/projects
+    percorre_naogit "$base" 0
 }
 
 #------------------------------------------------------------------------------
@@ -255,10 +314,21 @@ coleta_inventarios() {
     inv home-origem.txt printf '%s\n' "$HOME"
     inv usuario-origem.txt id -un
     inv snap.txt bash -c "snap list | awk 'NR>1{print \$1, \$4}'"
+    inv snap-classic.txt bash -c "snap list | awk 'NR>1 && \$NF ~ /classic/{print \$1}'"
     command -v flatpak >/dev/null 2>&1 && inv flatpak.txt flatpak list --app --columns=application,origin
     inv pip-user.txt python3 -m pip list --user --format=freeze
     # shellcheck disable=SC2016
-    inv npm-global.txt bash -c 'source "$HOME/.nvm/nvm.sh" 2>/dev/null; npm ls -g --depth=0 --parseable | tail -n +2 | xargs -n1 basename'
+    inv npm-global.txt bash -c 'source "$HOME/.nvm/nvm.sh" 2>/dev/null; npm ls -g --depth=0 --parseable | tail -n +2 | sed "s#.*/node_modules/##"'
+    # shellcheck disable=SC2016
+    inv npm-global-versoes.txt bash -c 'source "$HOME/.nvm/nvm.sh" 2>/dev/null; npm ls -g --depth=0 | tail -n +2 | sed "s/^[^a-zA-Z@]*//"'
+    inv deb-externos.txt bash -c "apt list --installed 2>/dev/null | grep ',local\]' | cut -d/ -f1"
+    inv apt-repos.txt bash -c 'ls /etc/apt/sources.list.d /etc/apt/keyrings 2>/dev/null'
+    inv go-bin.txt ls "$HOME/go/bin"
+    inv bin-fora-do-apt.txt bash -c 'find "$HOME/.local/bin" /usr/local/bin /opt -maxdepth 1 \( -type f -o -type d \) ! -type l -printf "%p\n" 2>/dev/null | sort'
+    inv appimages.txt bash -c 'find "$HOME" -maxdepth 3 -iname "*.AppImage" -not -path "*/projects/*" 2>/dev/null'
+    inv fontes-usuario.txt bash -c 'fc-list : file 2>/dev/null | grep -v "^/usr/" | sort'
+    inv gnome-extensoes.txt gnome-extensions list
+    [ -d "$HOME/.kiro/extensions" ] && inv kiro-extensoes.txt bash -c 'ls "$HOME/.kiro/extensions" | grep -v "\.json$" | sed -E "s/-[0-9][0-9.]*(-.*)?$//"'
     [ -d "$HOME/.nvm/versions/node" ] && inv node-versoes.txt ls "$HOME/.nvm/versions/node"
     command -v uv >/dev/null 2>&1 && inv uv-tools.txt uv tool list
     command -v pipx >/dev/null 2>&1 && inv pipx.txt pipx list --short
@@ -276,11 +346,10 @@ coleta_inventarios() {
     inv zram.txt zramctl
     inv swap.txt swapon --show
     # shellcheck disable=SC2016
-    inv versoes-ferramentas.txt bash -c 'for c in docker node uv gh aws terraform kubectl helm k9s argocd kiro-cli claude rclone tailscale openvpn; do printf "%s: " "$c"; ( "$c" --version 2>&1 || "$c" version --client 2>&1 ) | head -1; done'
+    inv versoes-ferramentas.txt bash -c 'for c in docker node uv gh aws terraform kubectl helm k9s argocd kiro kiro-cli claude gemini rclone tailscale openvpn teamviewer; do printf "%s: " "$c"; ( "$c" --version 2>&1 || "$c" version --client 2>&1 ) | head -1; done'
     # units do usuario que NAO sao symlink (os symlinks para o repo do harness o install.sh recria)
     if [ -d "$HOME/.config/systemd/user" ]; then
         find "$HOME/.config/systemd/user" -maxdepth 2 -type f -printf '%P\n' 2>/dev/null > "$STAGE/$META/inventario/systemd-user-units-proprias.txt" || true
-        while IFS= read -r u; do printf '%s\0' ".config/systemd/user/$u" >> "$LISTA"; done < "$STAGE/$META/inventario/systemd-user-units-proprias.txt"
         [ ! -s "$STAGE/$META/inventario/systemd-user-units-proprias.txt" ] && rm -f "$STAGE/$META/inventario/systemd-user-units-proprias.txt"
     fi
 }
@@ -393,10 +462,12 @@ monta_manifesto() {
     cat "$MAN"
     echo
     echo "== Projetos em ~/projects =="
-    echo "Regra: repo so entra se tiver mudanca nao enviada, commit nao enviado, sem remoto ou fora do GitHub;"
+    echo "Regra: repo so entra inteiro se tiver mudanca nao enviada, commit nao enviado, sem remoto ou fora do GitHub (os outros so levam os arquivos ignorados pelo git);"
     echo "os demais sao re-clonados no restore. Pasta fora do git entra ate ${PROJ_MAX_MB} MB."
     sort "$PROJ_MAN"
     echo "Resumo: $(grep -c '^INCLUIDO' "$PROJ_MAN" || true) incluidos, $(grep -c '^CLONAR' "$PROJ_MAN" || true) a clonar no setup, $(grep -c '^IGNORADO' "$PROJ_MAN" || true) ignorados"
+    echo "Pastas fora do git incluidas: $NAOGIT_N (puladas por tamanho: $NAOGIT_PULADOS)"
+    echo "Ignorados pelo git (.env, .tfvars, .pem etc., sem node_modules/.terraform/venv/dist/build/target): $IGN_N itens, $(fmt_bytes "$IGN_BYTES"); pulados por passar de ${IGN_MAX_MB} MB: $IGN_PULADOS"
     echo
     echo "== Inventarios (dentro do tar, em $META/inventario/) =="
     if [ -d "$STAGE/$META/inventario" ]; then

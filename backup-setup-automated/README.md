@@ -11,7 +11,7 @@ Backup completo e setup de uma máquina Ubuntu 26.04 LTS (dev/DevOps + harness d
 
 ```bash
 # 1. máquina antiga: conferir o que entra (não grava nada, não pede senha)
-./backup.sh /media/$USER/<disco> --dry-run
+./backup.sh /media/$USER/<disco> --dry-run   # --sem-sudo se quiser conferir sem sudo
 
 # 2. máquina antiga: backup de verdade (pede sudo e a senha, duas vezes; a senha nunca é gravada)
 ./backup.sh /media/$USER/<disco>
@@ -25,25 +25,50 @@ Depois do setup: logout/login (grupo docker, shell zsh) e reboot (o `claude-remo
 
 ## O que o backup leva
 
-`~/.ssh`, `~/.aws` (sem cache de SSO), `~/.kube`, `~/.terraform.d` (sem plugin-cache), `~/.config/rclone`, `~/.config/gh`,
-`~/.gnupg`, extras da sua máquina (lista em `~/.config/backup-ubuntu-extras.txt`, fora do repo), perfis de VPN (NetworkManager, via sudo, e arquivos `.ovpn`), `~/.zsh_secrets` e aliases, `~/.gitconfig`,
-`~/.kiro`, `~/.claude`, `~/.local/share/jarvis`, `~/Documentos`, `~/Documents`, `~/Pictures`, repos de `~/projects` com
-mudança não enviada (ou fora do GitHub), inventários (apt, snap, flatpak, pip, npm, uv, extensões, dconf, crontab, units
-systemd) e os arquivos de `/etc` que não são de pacote (zram, DKMS, modprobe, sysctl...).
-`~/Downloads` fica de fora de propósito. `--sem-sudo` pula `/etc` e as VPNs do NetworkManager.
+- **Segredos e logins** (grupo `segredos`): `~/.ssh`, `~/.aws` (sem cache de SSO), `~/.kube`, `~/.terraform.d` (sem plugin-cache),
+  `~/.config/gh`, `~/.config/rclone`, `~/.docker/config.json`, `~/.gnupg`, `~/.cert`, `~/.gemini`, `~/.config/gcloud` e `~/.config/kiro-cli`
+  (se existirem), token do Kiro CLI, keyring do GNOME (`~/.local/share/keyrings`), `~/.zsh_secrets`, `~/.claude.json`,
+  `.netrc`/`.npmrc`, VPNs (NetworkManager via sudo, `.ovpn`, `~/.cert`) e os extras da máquina (`~/.config/backup-ubuntu-extras.txt`, fora do repo).
+- **Harness, Jarvis e segundo cérebro**: `~/.claude` (inclui `.credentials.json`, `projects`, `jobs` e memória; sem caches),
+  `~/.kiro`, `~/.local/share/jarvis` e `~/.local/share/voz` (modelos incluídos; as venvs ficam de fora e o `install.sh` do
+  harness recria), `~/.config/systemd/user`.
+- **Config**: shell, `~/.gitconfig`, `~/.tmux.conf`, VS Code/Kiro (settings, atalhos, snippets), fontes do usuário, `.desktop` do usuário, dconf (GNOME).
+- **Dados**: `~/Documentos`, `~/Documents`, `~/Pictures`, `~/Desktop`, `~/scratch` e as pastas de `~/backup-git-*`. `~/Downloads` fica de fora.
+- **`~/projects`**: repo com mudança não enviada, commit não enviado, sem remoto ou fora do GitHub entra inteiro; os demais voltam por
+  `git clone` e só levam os **arquivos ignorados pelo git** (`.env`, `.tfvars`, `.pem`...; sem `node_modules`, `.terraform`, venv,
+  `__pycache__`, `dist`, `build`, `target`; passou de `--ignorado-max-mb`, 100 por padrão, é pulado e contado no manifesto).
+  Pastas e arquivos fora do git, em qualquer nível, entram até `--projeto-max-mb` (2048 por padrão).
+- **Listas de pacotes** (em `.backup-ubuntu-meta/inventario/`, o restore reinstala a partir delas): `apt-manual`, `snap` (+ `snap-classic`),
+  `npm-global`, `vscode-extensoes`, `kiro-extensoes`, `pip-user`, `uv-tools`, `pipx`, `cargo`, `gh-extensoes`, `crontab`, `dconf.ini`,
+  mais `deb-externos`, `apt-repos`, `bin-fora-do-apt`, `appimages`, `fontes-usuario`, `systemd-user-enabled`, `versoes-ferramentas`.
+- **Sistema (sudo)**: `/etc` que não é de pacote (zram, DKMS, modprobe, sysctl, `apt/sources.list.d`...), `/etc/NetworkManager/system-connections`,
+  `/etc/systemd/zram-generator.conf`. `--sem-sudo` pula essa parte.
 
 O destino não pode estar num repo git nem no HOME: o arquivo leva segredos.
 
-## O que o setup instala
+## O que o setup faz, na ordem
 
-Base e build, Docker (repo oficial), Node (nvm + NodeSource), uv + Python 3.12 (as venvs do Jarvis), gh, AWS CLI v2 e
-session-manager-plugin, Terraform, kubectl/helm/k9s/argocd, stern/lazygit/trivy/actionlint/kubectx, Kiro CLI, Claude Code,
-rclone, Tailscale, OpenVPN 3 e plugin do NetworkManager, Chrome/VS Code/Slack/Spotify/Postman/DBeaver, DisplayLink (evdi por
-DKMS, com o conserto do módulo que não recompila quando o kernel muda de build), zram (zram0 4 GB lzo-rle + zram1 4 GB zstd)
-e `/swap.img`, libs do WebKit do Playwright, zsh + oh-my-zsh, e o harness (clona `dotfiles-claude`, roda o `install.sh`,
-liga linger e os serviços `claude-remote`/`jarvis`).
+`apt` (base + extras de uso) → `restore` (devolve o backup: segredos e logins vêm antes de tudo) → `docker` → `node` (nvm + NodeSource) →
+`uv` (+ Python 3.12) → `gh` → `aws` (CLI v2, session-manager-plugin, aws_signing_helper) → `terraform` → `kubectl` (helm, k9s, argocd) →
+`cli-extra` (stern, lazygit, trivy, actionlint, kubectx) → `kiro` (CLI **e IDE**) → `claude` → `cli-ia` (Gemini CLI, xo-cli) → `rclone` →
+`tailscale` → `vpn` (openvpn3) → `apps` (Chrome, VS Code, Firefox, Telegram, Slack, Spotify, Postman, btop, DBeaver, TeamViewer) →
+`displaylink` → `zram` → `playwright` → `shell` (zsh + oh-my-zsh) → `pacotes` (reinstala as listas do backup: apt, snap, npm -g,
+extensões do VS Code e do Kiro, pip, uv, pipx, gh, dconf, cron) → `projetos` (clona os repos que não estavam no tar) →
+`harness` (clona `dotfiles-claude`, roda o `install.sh`, liga linger e as units que estavam ligadas).
 
-Repos de terceiros sem a suite do Ubuntu novo caem para a `noble` automaticamente.
+Cada etapa confere o estado antes de agir; rodar de novo só refaz o que falta. Repos de terceiros sem a suite do Ubuntu novo caem para a `noble`.
+
+### Pré-requisitos do harness (`dotfiles-claude`, privado)
+
+`git`, `gh` **logado** (o login vem do backup; senão `gh auth login`), `tmux`, `jq`, `python3` do sistema, Node do sistema, `curl`, `unzip`,
+`kiro-cli` e `claude` em `~/.local/bin`, systemd `--user` com linger, libs de áudio (portaudio, sndfile, espeak-ng, ffmpeg). O `install.sh`
+do harness instala o `uv` com sha256 fixo e cria as venvs da voz/Jarvis (Python 3.12, pacotes com hash).
+
+### Fica manual
+
+Logins que o backup não garante: `gh auth login` (se o token expirou), `aws sso login`, `kiro-cli login`, `claude`, `gemini`,
+`sudo tailscale up` (e refazer o `tailscale serve` do Jarvis), chave MOK do DKMS com Secure Boot. NoMachine e GitKraken CLI: baixar à mão.
+Perfis do Chrome e do Firefox (favoritos, senhas) não entram no backup.
 
 ## Não vai para o repo
 

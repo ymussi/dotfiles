@@ -13,9 +13,9 @@
 #   --sem-harness       nao clona o dotfiles-claude nem roda o install.sh dele.
 #   --sem-displaylink   pula o driver DisplayLink (dock USB).
 #   --sem-projetos      no restore, nao re-clona os repos de ~/projects.
-#   --pular ETAPA       pula uma etapa (repetivel). Nomes: apt docker node uv gh aws
-#                       terraform kubectl cli-extra kiro claude rclone tailscale vpn apps
-#                       displaylink zram playwright shell harness
+#   --pular ETAPA       pula uma etapa (repetivel). Nomes: apt restore docker node uv gh aws
+#                       terraform kubectl cli-extra kiro claude cli-ia rclone tailscale vpn
+#                       apps displaylink zram playwright shell pacotes projetos harness
 #   --so ETAPA          roda so a etapa (repetivel; "restore" tambem vale).
 #   --listar            lista as etapas e sai.
 #   -h, --help
@@ -37,7 +37,10 @@ PY_VERSAO="${PY_VERSAO:-3.12}"
 SWAP_FILE_GB="${SWAP_FILE_GB:-8}"
 ZRAM_MB_0="${ZRAM_MB_0:-4096}"; ZRAM_ALGO_0="${ZRAM_ALGO_0:-lzo-rle}"
 ZRAM_MB_1="${ZRAM_MB_1:-4096}"; ZRAM_ALGO_1="${ZRAM_ALGO_1:-zstd}"
-HARNESS_REPO="${HARNESS_REPO:-git@github.com:ymussi/dotfiles-claude.git}"
+HARNESS_REPO="${HARNESS_REPO:-https://github.com/ymussi/dotfiles-claude.git}"
+HARNESS_REPO_SSH="${HARNESS_REPO_SSH:-git@github.com:ymussi/dotfiles-claude.git}"
+RESTORE_DIR="$HOME/.local/share/backup-ubuntu-restore"
+INV="$RESTORE_DIR/inventario"
 HARNESS_DIR="${HARNESS_DIR:-$HOME/projects/dotfiles-claude}"
 META=".backup-ubuntu-meta"
 
@@ -51,12 +54,12 @@ secao() { echo; echo "=== $* ==="; }
 export DEBIAN_FRONTEND=noninteractive
 TMO() { timeout "$@"; }
 
-ETAPAS=(apt docker node uv gh aws terraform kubectl cli-extra kiro claude rclone tailscale vpn apps displaylink zram playwright shell restore harness)
+ETAPAS=(apt restore docker node uv gh aws terraform kubectl cli-extra kiro claude cli-ia rclone tailscale vpn apps displaylink zram playwright shell pacotes projetos harness)
 RESTORE_ARG=""; AUTO_RESTORE=false; SEM_PROJ=false
 declare -A PULAR=() SO=()
 FALHAS=()
 
-uso() { sed -n '2,/^#====.*$/p' "$0" | sed -n '2,32p' | sed 's/^# \{0,1\}//'; }
+uso() { sed -n '2,/^#====.*$/p' "$0" | sed -n '2,33p' | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -151,7 +154,10 @@ etapa_apt() {
         network-manager network-manager-openvpn network-manager-openvpn-gnome openvpn \
         ffmpeg libportaudio2 libsndfile1 espeak-ng pulseaudio-utils v4l-utils \
         libnss3-tools bash-completion shellcheck remmina remmina-plugin-rdp fastfetch
-    # curl de snap/apt pode faltar zsh plugins: tratados na etapa shell
+    # ferramentas de uso diario que estao nesta maquina (apt-mark showmanual): rede, arquivos, escritorio
+    apt_garante aria2 cifs-utils nfs-common samba-common-bin ntfs-3g lvm2 efibootmgr nmap whois traceroute \
+        sshpass sqlite3 redis-server wireguard xrdp wl-clipboard fonts-firacode fprintd libpam-fprintd \
+        freerdp3-x11 libreoffice pdfarranger simple-scan vlc libvhdi-utils libpng-dev || warn "alguns pacotes extras do apt nao instalaram"
     return 0
 }
 
@@ -224,6 +230,13 @@ etapa_aws() {
         unzip -q "$d/aws.zip" -d "$d" && TMO 300 sudo "$d/aws/install" --update || return 1
         rm -rf "$d"
     fi
+    # IAM Roles Anywhere (voz do Jarvis na Polly): versao fixa, igual a desta maquina
+    if ! tem aws_signing_helper && [ ! -x "$HOME/.local/bin/aws_signing_helper" ]; then
+        local sh_v="${AWS_SIGNING_HELPER_VERSAO:-1.8.5}" sh_a=X86_64; [ "$ARCH" = arm64 ] && sh_a=Aarch64
+        mkdir -p "$HOME/.local/bin"
+        baixa "https://rolesanywhere.amazonaws.com/releases/$sh_v/$sh_a/Linux/Amzn2023/aws_signing_helper" "$HOME/.local/bin/aws_signing_helper" 300 \
+            && chmod 755 "$HOME/.local/bin/aws_signing_helper" || warn "aws_signing_helper nao baixou"
+    else skip "aws_signing_helper"; fi
     if ! tem session-manager-plugin; then
         local d; d="$(tmpd)"
         local arq=ubuntu_64bit; [ "$ARCH" = arm64 ] && arq=ubuntu_arm64
@@ -324,12 +337,23 @@ etapa_apps() {
         TMO 900 sudo apt-get install -y code || rc=1
     else skip "vscode"; fi
     local app flag
-    for app in slack spotify postman btop dbeaver-ce; do
+    for app in firefox telegram-desktop slack spotify postman btop dbeaver-ce; do
         snap list "$app" >/dev/null 2>&1 && { skip "snap $app"; continue; }
         flag=""; [ "$app" = slack ] && flag="--classic"
         # shellcheck disable=SC2086
         TMO 900 sudo snap install "$app" $flag || { warn "snap $app falhou"; rc=1; }
     done
+    # TeamViewer (deb oficial; o pacote cria o repo apt dele)
+    if ! tem teamviewer; then
+        local d; d="$(tmpd)"
+        if baixa https://download.teamviewer.com/download/linux/teamviewer_amd64.deb "$d/tv.deb" 600; then
+            TMO 900 sudo apt-get install -y "$d/tv.deb" || { warn "teamviewer nao instalou"; rc=1; }
+        else warn "nao baixei o teamviewer"; rc=1; fi
+        rm -rf "$d"
+    else skip "teamviewer"; fi
+    # NoMachine: o link do deb muda a cada versao e exige a pagina de download; fica manual
+    pkg_instalado nomachine-personal-edition || warn "NoMachine: baixe o deb em nomachine.com/download e rode: sudo apt install ./nomachine_*.deb"
+    # GitKraken CLI (gk): sem URL estavel verificada; fica manual (gitkraken.com/cli)
     return $rc
 }
 
@@ -341,6 +365,15 @@ etapa_kiro() {
         TMO 600 bash -c 'curl -fsSL https://cli.kiro.dev/install | bash' || return 1
     fi
     warn "Kiro CLI: login com 'kiro-cli login' (o backup traz o token, mas ele pode ter expirado)."
+    # Kiro IDE: deb oficial da ultima versao estavel (o metadata do site diz qual)
+    if tem kiro; then skip "kiro IDE"; elif [ "$ARCH" = amd64 ]; then
+        local v d; d="$(tmpd)"
+        v="$(TMO 30 curl -fsSL https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json | grep -oP '"currentRelease":"\K[^"]+' | head -1)"
+        if [ -n "$v" ] && baixa "https://prod.download.desktop.kiro.dev/releases/stable/linux-x64/signed/$v/deb/kiro-ide-$v-stable-linux-x64.deb" "$d/kiro.deb" 900; then
+            TMO 900 sudo apt-get install -y "$d/kiro.deb" || { warn "kiro IDE nao instalou"; rm -rf "$d"; return 1; }
+        else warn "nao baixei o Kiro IDE (versao '$v')"; rm -rf "$d"; return 1; fi
+        rm -rf "$d"
+    else warn "Kiro IDE: sem build para $ARCH"; fi
     return 0
 }
 
@@ -355,12 +388,39 @@ etapa_claude() {
 # 7. rclone, Tailscale, openvpn (3 e NetworkManager)
 #==============================================================================
 etapa_rclone() {
-    if tem rclone; then skip "rclone"; return 0; fi
-    apt_garante rclone || return 1
-    # O rclone do apt pode estar atrasado: se a versao nao suportar o remote do backup, use rclone selfupdate.
-    return 0
+    if tem rclone || [ -x "$HOME/.local/bin/rclone" ]; then skip "rclone"; return 0; fi
+    # binario oficial (o do apt costuma estar atrasado para os remotes novos), em ~/.local/bin como nesta maquina
+    local d; d="$(tmpd)"
+    if baixa "https://downloads.rclone.org/rclone-current-linux-${ARCH_GO}.zip" "$d/r.zip" 300 && unzip -q "$d/r.zip" -d "$d"; then
+        mkdir -p "$HOME/.local/bin"
+        install -m 0755 "$d"/rclone-*/rclone "$HOME/.local/bin/rclone"; rm -rf "$d"; return 0
+    fi
+    rm -rf "$d"; warn "rclone oficial nao baixou; tentando o do apt"
+    apt_garante rclone
 }
 
+#==============================================================================
+# 7a. CLIs de IA e utilitarios que vivem no npm global (nvm): Gemini CLI, xo-cli
+#==============================================================================
+carrega_nvm() { export NVM_DIR="$HOME/.nvm"; # shellcheck disable=SC1091
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; tem npm; }
+npm_garante() { # npm_garante pacote...
+    local pk rc=0
+    for pk in "$@"; do
+        npm ls -g --depth=0 "$pk" 2>/dev/null | grep -q "$pk@" && { skip "npm -g $pk"; continue; }
+        TMO 600 npm install -g "$pk" </dev/null || { warn "npm -g $pk falhou"; rc=1; }
+    done
+    return $rc
+}
+etapa_cli_ia() {
+    carrega_nvm || { warn "npm ausente (etapa node)"; return 1; }
+    # xo-cli: nesta maquina e build do fonte em /opt/xo; aqui vem o pacote do npm (mesmo CLI, outro caminho)
+    npm_garante @google/gemini-cli xo-cli
+}
+
+#==============================================================================
+# 7. Tailscale, openvpn (3 e NetworkManager)
+#==============================================================================
 etapa_tailscale() {
     if ! tem tailscale; then
         local suite; suite="$(suite_ou_fallback "https://pkgs.tailscale.com/stable/ubuntu/$CODENAME.noarmor.gpg")"
@@ -516,13 +576,27 @@ restaura_projetos() {
     local tsv="$1" n=0 rel url
     [ -s "$tsv" ] || return 0
     export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+    tem gh && gh auth status >/dev/null 2>&1 && gh auth setup-git >/dev/null 2>&1
     while IFS=$'\t' read -r rel url; do
         [ -n "$rel" ] || continue
         [ -d "$HOME/$rel/.git" ] && continue
         mkdir -p "$(dirname "$HOME/$rel")"
-        TMO 300 git clone -q "$url" "$HOME/$rel" 2>/dev/null && n=$((n+1)) || warn "nao clonei ~/$rel"
+        TMO 300 git clone -q "$url" "$HOME/$rel" 2>/dev/null </dev/null && n=$((n+1)) || warn "nao clonei ~/$rel"
     done < "$tsv"
     info "$n repositorios clonados"
+}
+
+# Permissao certa em tudo que e segredo (o tar de usuario comum aplica umask, entao fecha de novo)
+fecha_permissoes() {
+    local p
+    for p in .ssh .aws .kube .gnupg .terraform.d .cert .docker .gemini .config/gh .config/rclone .config/gcloud \
+             .config/kiro-cli .config/teamviewer .config/xo-cli .local/share/keyrings .local/share/kiro-cli \
+             .local/share/jarvis .claude .kiro .zsh_secrets .claude.json .netrc .npmrc .slack_secret; do
+        [ -e "$HOME/$p" ] && chmod -R go-rwx "$HOME/$p" 2>/dev/null
+    done
+    [ -d "$HOME/.ssh" ] && { chmod 700 "$HOME/.ssh"; find "$HOME/.ssh" -type f -name '*.pub' -exec chmod 644 {} +; }
+    [ -d "$HOME/.gnupg" ] && find "$HOME/.gnupg" -type d -exec chmod 700 {} +
+    return 0
 }
 
 etapa_restore() {
@@ -556,15 +630,7 @@ etapa_restore() {
             [ -e "$HOME/$f" ] || [ -L "$HOME/$f" ] || { mkdir -p "$(dirname "$HOME/$f")"; cp -a "$meta/deref/$f" "$HOME/$f"; }
         done
     fi
-
-    # Permissoes
-    [ -d "$HOME/.ssh" ] && { chmod 700 "$HOME/.ssh"; find "$HOME/.ssh" -type f \( -name 'id_*' -o -name '*.pem' -o -name '*_key' \) ! -name '*.pub' -exec chmod 600 {} +; }
-    [ -d "$HOME/.gnupg" ] && chmod 700 "$HOME/.gnupg"
-    [ -d "$HOME/.aws" ] && chmod 700 "$HOME/.aws"
-    [ -d "$HOME/.kube" ] && chmod 700 "$HOME/.kube"
-    [ -f "$HOME/.zsh_secrets" ] && chmod 600 "$HOME/.zsh_secrets"
-    [ -f "$HOME/.terraform.d/credentials.tfrc.json" ] && chmod 600 "$HOME/.terraform.d/credentials.tfrc.json"
-    [ -d "$HOME/.cert" ] && find "$HOME/.cert" -type f -exec chmod 600 {} +
+    fecha_permissoes
 
     # Perfis de VPN do NetworkManager (reescreve o HOME de origem, se o usuario mudou)
     local raiz="$meta/raiz" origem; origem="$(cat "$meta/inventario/home-origem.txt" 2>/dev/null || true)"
@@ -589,38 +655,123 @@ etapa_restore() {
             sudo mkdir -p "$(dirname "$rel")" && sudo cp -a "$f" "$rel"
         done < <(find "$raiz/etc" -type f)
         info "hosts de origem em $raiz/etc/hosts (nao aplicado automaticamente; confira)."
-        mkdir -p "$HOME/.local/share/backup-ubuntu-restore" && cp -a "$raiz/etc/hosts" "$HOME/.local/share/backup-ubuntu-restore/hosts.origem" 2>/dev/null || true
+        mkdir -p "$RESTORE_DIR" && cp -a "$raiz/etc/hosts" "$RESTORE_DIR/hosts.origem" 2>/dev/null || true
     fi
-    # Lista de pacotes de origem: guardada para consulta, nao reinstalada as cegas
-    mkdir -p "$HOME/.local/share/backup-ubuntu-restore"
-    cp -a "$meta/inventario" "$HOME/.local/share/backup-ubuntu-restore/" 2>/dev/null || true
-    [ -f "$meta/MANIFESTO.txt" ] && cp -a "$meta/MANIFESTO.txt" "$HOME/.local/share/backup-ubuntu-restore/" || true
+    # Listas de pacotes (alimentam a etapa "pacotes"), lista de repos a clonar (etapa "projetos") e manifesto
+    mkdir -p "$RESTORE_DIR"
+    cp -a "$meta/inventario" "$RESTORE_DIR/" 2>/dev/null || true
+    [ -f "$meta/projetos-clonar.tsv" ] && cp -a "$meta/projetos-clonar.tsv" "$RESTORE_DIR/" || true
+    [ -f "$meta/MANIFESTO.txt" ] && cp -a "$meta/MANIFESTO.txt" "$RESTORE_DIR/" || true
 
     # sha256 por arquivo (config e segredos)
     if [ -f "$meta/SHA256-ARQUIVOS.txt" ]; then
         local ruins; ruins="$( cd "$HOME" && sha256sum -c "$meta/SHA256-ARQUIVOS.txt" 2>/dev/null | grep -vc ': OK$' || true )"
         info "sha256 por arquivo: $ruins divergentes (arquivos que ja existiam antes do restore divergem de proposito)."
     fi
-
-    # Repos de ~/projects que nao estavam no tar
-    $SEM_PROJ || restaura_projetos "$meta/projetos-clonar.tsv"
-
-    # Limpa a pasta de meta (os inventarios ficaram em ~/.local/share/backup-ubuntu-restore)
     rm -rf "$meta"
-    info "restore concluido."
+    info "restore concluido (pacotes e repos vem nas etapas pacotes e projetos)."
     return 0
 }
 
 #==============================================================================
-# 13. Harness: clonar dotfiles-claude, install.sh, servicos e linger
+# 12b. Pacotes a partir das listas do backup: apt, snap, npm global, extensoes
+#      do VS Code e do Kiro, pip --user, uv tool, pipx, extensoes do gh, dconf, cron
+#==============================================================================
+etapa_pacotes() {
+    [ -d "$INV" ] || { warn "sem inventario do backup ($INV): etapa pacotes pulada (use --restore)."; return 0; }
+    local ret=0 l nome flag have ext
+    # apt: o que foi instalado a mao la, menos pacote de sistema, kernel, bootloader e metapacote de desktop
+    if [ -s "$INV/apt-manual.txt" ]; then
+        l="$(grep -vE '^(linux-|grub|shim|ubuntu-|language-pack|ibus|libchewing|libpinyin|libopencc|libm17n|libotf|m17n|wbritish|bsdutils|dash$|diffutils|findutils|grep$|gzip|hostname|init$|login$|ncurses|python3-minimal|tailscale-archive|synaptics-repository)' "$INV/apt-manual.txt" || true)"
+        # shellcheck disable=SC2086
+        [ -z "$l" ] || apt_garante $l || { warn "apt: alguns pacotes da lista nao instalaram"; ret=1; }
+    fi
+    # snap
+    if [ -s "$INV/snap.txt" ]; then
+        while read -r nome _; do
+            case "$nome" in ""|bare|core*|gnome-*|gtk-common-themes|mesa-*|snapd|snapd-desktop-integration|snap-store|firmware-updater|desktop-security-center|prompting-client) continue ;; esac
+            snap list "$nome" >/dev/null 2>&1 && continue
+            flag=""; grep -qx "$nome" "$INV/snap-classic.txt" 2>/dev/null && flag="--classic"
+            # shellcheck disable=SC2086
+            TMO 900 sudo snap install "$nome" $flag </dev/null || { warn "snap $nome falhou"; ret=1; }
+        done < "$INV/snap.txt"
+    fi
+    # npm global (nvm)
+    if [ -s "$INV/npm-global.txt" ] && carrega_nvm; then
+        while read -r nome; do
+            case "$nome" in ""|npm|corepack) continue ;; esac
+            npm_garante "$nome" || ret=1
+        done < "$INV/npm-global.txt"
+    fi
+    # extensoes do VS Code e do Kiro
+    local ed lista
+    for ed in code:vscode-extensoes.txt kiro:kiro-extensoes.txt; do
+        nome="${ed%%:*}"; lista="$INV/${ed#*:}"
+        tem "$nome" && [ -s "$lista" ] || continue
+        have="$(TMO 60 "$nome" --list-extensions 2>/dev/null || true)"
+        while read -r ext; do
+            [ -n "$ext" ] || continue
+            grep -qixF "$ext" <<<"$have" && continue
+            TMO 300 "$nome" --install-extension "$ext" </dev/null >/dev/null 2>&1 || { warn "$nome: extensao $ext nao instalou"; ret=1; }
+        done < "$lista"
+    done
+    # python --user, uv tool, pipx, extensoes do gh
+    if [ -s "$INV/pip-user.txt" ]; then
+        sed 's/==.*//' "$INV/pip-user.txt" | grep -v '^#' | xargs -r python3 -m pip install --user --break-system-packages -q 2>/dev/null || { warn "pip --user: alguns pacotes falharam"; ret=1; }
+    fi
+    export PATH="$HOME/.local/bin:$PATH"
+    if [ -s "$INV/uv-tools.txt" ] && tem uv; then
+        grep -vE '^(-|[[:space:]]|$)' "$INV/uv-tools.txt" | awk '{print $1}' | while read -r nome; do uv tool install "$nome" </dev/null || true; done
+    fi
+    if [ -s "$INV/pipx.txt" ] && tem pipx; then awk '{print $1}' "$INV/pipx.txt" | while read -r nome; do pipx install "$nome" </dev/null || true; done; fi
+    if [ -s "$INV/gh-extensoes.txt" ] && tem gh && gh auth status >/dev/null 2>&1; then
+        awk -F'\t' '{print $2}' "$INV/gh-extensoes.txt" | while read -r nome; do [ -n "$nome" ] && gh extension install "$nome" </dev/null || true; done
+    fi
+    [ -d "$HOME/.local/share/fonts" ] && tem fc-cache && fc-cache -f "$HOME/.local/share/fonts" >/dev/null 2>&1
+    # cron do usuario
+    if [ -s "$INV/crontab.txt" ] && ! crontab -l >/dev/null 2>&1; then crontab "$INV/crontab.txt" && info "crontab restaurado"; fi
+    # configuracao do GNOME (guarda a atual antes)
+    if [ -s "$INV/dconf.ini" ] && tem dconf; then
+        dconf dump / > "$RESTORE_DIR/dconf.antes.ini" 2>/dev/null || true
+        dconf load / < "$INV/dconf.ini" 2>/dev/null && info "dconf (GNOME) aplicado" \
+            || warn "dconf nao aplicado (precisa de sessao grafica). Depois: dconf load / < $INV/dconf.ini"
+    fi
+    return $ret
+}
+
+#==============================================================================
+# 12c. Repos de ~/projects que nao estavam no tar (precisa do gh logado ou da chave SSH, que vieram no restore)
+#==============================================================================
+etapa_projetos() {
+    if $SEM_PROJ; then skip "projetos (--sem-projetos)"; return 0; fi
+    [ -s "$RESTORE_DIR/projetos-clonar.tsv" ] || { warn "sem lista de repos ($RESTORE_DIR/projetos-clonar.tsv): nada a clonar."; return 0; }
+    restaura_projetos "$RESTORE_DIR/projetos-clonar.tsv"
+}
+
+#==============================================================================
+# 13. Harness / Jarvis / segundo cerebro: clonar dotfiles-claude (privado), install.sh, servicos e linger
+#     Pre-requisitos (README e install.sh do dotfiles-claude): git, gh logado (o login vem do backup),
+#     tmux e jq, python3 do sistema (/usr/bin/python3), Node do sistema (servicos systemd), curl e unzip,
+#     kiro-cli e claude em ~/.local/bin, systemd --user + linger, uv e python 3.12 (o install.sh instala o uv
+#     com sha256 fixo e cria as venvs da voz/Jarvis com hash), libs de audio (portaudio, sndfile, espeak-ng, ffmpeg)
+#     e, ja restaurados do backup: ~/.zsh_secrets, ~/.claude, ~/.kiro, ~/.local/share/jarvis, ~/.local/share/voz.
 #==============================================================================
 etapa_harness() {
     export PATH="$HOME/.local/bin:$PATH"
+    local c falta=""
+    for c in git gh tmux jq python3 curl unzip node systemctl kiro-cli claude; do tem "$c" || falta="$falta $c"; done
+    [ -z "$falta" ] || warn "pre-requisitos do harness ausentes:$falta (rode as etapas apt/node/gh/kiro/claude)."
     if [ ! -d "$HARNESS_DIR/.git" ]; then
-        tem gh && gh auth status >/dev/null 2>&1 || ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | grep -qi 'successfully authenticated' \
-            || { erro "sem acesso ao GitHub (chave SSH ou gh auth). Restaure o backup (--restore) ou rode 'gh auth login' e repita com --so harness."; return 1; }
         mkdir -p "$(dirname "$HARNESS_DIR")"
-        GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" TMO 600 git clone "$HARNESS_REPO" "$HARNESS_DIR" || return 1
+        if tem gh && gh auth status >/dev/null 2>&1; then
+            gh auth setup-git >/dev/null 2>&1
+            TMO 600 git clone "$HARNESS_REPO" "$HARNESS_DIR" </dev/null || return 1
+        elif ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | grep -qi 'successfully authenticated'; then
+            GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" TMO 600 git clone "$HARNESS_REPO_SSH" "$HARNESS_DIR" </dev/null || return 1
+        else
+            erro "sem acesso ao GitHub (o repo do harness e privado). Restaure o backup (--restore, traz ~/.config/gh e ~/.ssh) ou rode 'gh auth login' e repita com --so harness."
+            return 1
+        fi
     else
         skip "harness ja clonado em $HARNESS_DIR"
         TMO 120 git -C "$HARNESS_DIR" pull --ff-only 2>/dev/null || warn "git pull do harness nao avancou (mudanca local ou sem rede); sigo com o que ha."
@@ -630,16 +781,22 @@ etapa_harness() {
     # O install.sh linka config, binarios, units systemd --user, venvs da voz (uv, python 3.12 fixo) e liga os timers essenciais
     ( cd "$HARNESS_DIR" && TMO 1800 ./install.sh ) || { erro "install.sh do harness falhou"; return 1; }
     systemctl --user daemon-reload 2>/dev/null || true
-    local u
-    for u in claude-remote.service jarvis.service escritorio-local.service; do
-        [ -e "$HOME/.config/systemd/user/$u" ] || { warn "unit $u nao foi linkada pelo install.sh"; continue; }
+    # Liga o que estava ligado na maquina de origem (lista do backup); sem lista, os tres servicos base
+    local u lista="$INV/systemd-user-enabled.txt" unidades=""
+    if [ -s "$lista" ]; then
+        unidades="$(awk '{print $1}' "$lista" | grep -Ev '^(snap\.|gnome|gcr|gpg|dirmngr|keyboxd|org\.|pipewire|wireplumber|obex|mpris|xdg|spice|upgrade|user-session|ubuntu|filter-chain|openvpn3|dbus)' || true)"
+    fi
+    [ -n "$unidades" ] || unidades="claude-remote.service jarvis.service escritorio-local.service"
+    for u in $unidades; do
+        [ -e "$HOME/.config/systemd/user/$u" ] || continue
         systemctl --user is-enabled --quiet "$u" 2>/dev/null || systemctl --user enable "$u" 2>/dev/null || warn "nao habilitei $u"
     done
     # jarvis e escritorio-local sobem agora; o claude-remote so no proximo boot (subir agora abriria uma segunda sessao do Head)
     for u in jarvis.service escritorio-local.service; do
         [ -e "$HOME/.config/systemd/user/$u" ] && { systemctl --user is-active --quiet "$u" || systemctl --user start "$u" 2>/dev/null || warn "$u nao subiu (veja journalctl --user -u $u)"; }
     done
-    warn "Logins que o backup nao resolve: 'gh auth login' (se o token expirou), 'aws sso login', 'kiro-cli login', 'claude' (login), 'sudo tailscale up'."
+    tem tailscale && warn "Jarvis fica exposto por 'tailscale serve': depois do 'sudo tailscale up', refaca o serve (veja o README do dotfiles-claude)."
+    warn "Logins que o backup nao resolve: 'gh auth login' (se o token expirou), 'aws sso login', 'kiro-cli login', 'claude' (login), 'gemini' (login), 'sudo tailscale up'."
     return 0
 }
 
@@ -653,6 +810,7 @@ fi
 sudo -v || { erro "preciso do sudo"; exit 1; }
 
 executa_etapa apt etapa_apt
+executa_etapa restore etapa_restore
 executa_etapa docker etapa_docker
 executa_etapa node etapa_node
 executa_etapa uv etapa_uv
@@ -663,6 +821,7 @@ executa_etapa kubectl etapa_kubectl
 executa_etapa cli-extra etapa_cli_extra
 executa_etapa kiro etapa_kiro
 executa_etapa claude etapa_claude
+executa_etapa cli-ia etapa_cli_ia
 executa_etapa rclone etapa_rclone
 executa_etapa tailscale etapa_tailscale
 executa_etapa vpn etapa_vpn
@@ -671,7 +830,8 @@ executa_etapa displaylink etapa_displaylink
 executa_etapa zram etapa_zram
 executa_etapa playwright etapa_playwright
 executa_etapa shell etapa_shell
-executa_etapa restore etapa_restore
+executa_etapa pacotes etapa_pacotes
+executa_etapa projetos etapa_projetos
 executa_etapa harness etapa_harness
 
 echo
