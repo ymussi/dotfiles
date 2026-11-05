@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #==============================================================================
-# ubuntu-setup-automated.sh - setup de uma maquina Ubuntu 26.04 LTS do zero
+# ubuntu-setup-automated.sh - setup de uma maquina Ubuntu 26.10 (aceita 26.04 LTS) do zero
 # (dev/DevOps + harness de agentes), idempotente.
 #
 # Uso:
@@ -84,11 +84,14 @@ done
 # shellcheck disable=SC1091
 . /etc/os-release
 [ "${ID:-}" = "ubuntu" ] || { erro "script feito para Ubuntu (achei: ${ID:-?})"; exit 1; }
-CODENAME="${VERSION_CODENAME:-resolute}"
+CODENAME="${VERSION_CODENAME:-stonking}"
 ARCH="$(dpkg --print-architecture)"
 case "$ARCH" in amd64) ARCH_ALT=x86_64; ARCH_GO=amd64 ;; arm64) ARCH_ALT=aarch64; ARCH_GO=arm64 ;; *) erro "arquitetura nao suportada: $ARCH"; exit 1 ;; esac
-[ "${VERSION_ID%%.*}" -ge 24 ] || warn "pensado para o Ubuntu 26.04 (achei $VERSION_ID); pode funcionar, nao foi testado."
-[ "${VERSION_ID:-}" = "26.04" ] || warn "versao $VERSION_ID (alvo: 26.04)."
+case "${VERSION_ID:-}" in
+    26.10) ;;
+    26.04) info "Ubuntu 26.04: aceito (alvo principal: 26.10)." ;;
+    *) warn "versao ${VERSION_ID:-?} (alvo: 26.10; 26.04 tambem aceito); pode funcionar, nao foi testado." ;;
+esac
 
 executa_etapa() { # executa_etapa nome funcao
     local nome="$1" fn="$2"
@@ -101,18 +104,42 @@ executa_etapa() { # executa_etapa nome funcao
 tem() { command -v "$1" >/dev/null 2>&1; }
 pkg_instalado() { dpkg -s "$1" >/dev/null 2>&1; }
 apt_i() { sudo apt-get install -y --no-install-recommends "$@"; }
-apt_faltantes() { # imprime so os pacotes que ainda nao estao instalados e existem no repo
-    local p
+# Nome do pacote no repo atual: o proprio, ou o unico provedor se for pacote virtual (ex.: dnsutils -> bind9-dnsutils).
+apt_resolve() {
+    local p="$1" prov cand
+    # apt-cache show devolve 0 para pacote puramente virtual; o Candidate e que diz se ha versao instalavel
+    cand="$(apt-cache policy "$p" 2>/dev/null | awk '/Candidate:/{print $2}')"
+    if [ -n "$cand" ] && [ "$cand" != "(none)" ]; then printf '%s\n' "$p"; return 0; fi
+    prov="$(apt-cache showpkg "$p" 2>/dev/null | awk '/^Reverse Provides:/{f=1;next} f&&NF{print $1}' | sort -u)"
+    [ -n "$prov" ] && [ "$(printf '%s\n' "$prov" | wc -l)" -eq 1 ] && printf '%s\n' "$prov"
+}
+apt_faltantes() { # imprime so os pacotes que ainda nao estao instalados e existem no repo (os que nao existem so avisam)
+    local p r
     for p in "$@"; do
         pkg_instalado "$p" && continue
-        apt-cache show "$p" >/dev/null 2>&1 && printf '%s\n' "$p" || warn "pacote nao existe no repo: $p"
+        r="$(apt_resolve "$p")" || r=""
+        if [ -z "$r" ]; then warn "pacote nao existe neste release, pulado: $p"; continue; fi
+        pkg_instalado "$r" || printf '%s\n' "$r"
     done
 }
 apt_garante() {
-    local falt; falt="$(apt_faltantes "$@")"
+    local falt p rc=0; falt="$(apt_faltantes "$@")"
     [ -z "$falt" ] && return 0
     # shellcheck disable=SC2086
-    TMO 1200 sudo apt-get install -y --no-install-recommends $falt
+    TMO 1200 sudo apt-get install -y --no-install-recommends $falt && return 0
+    # um pacote que nao instala nao derruba a lista: tenta um a um e so avisa dos que falharem
+    warn "instalacao em lote falhou; tentando um a um"
+    for p in $falt; do TMO 600 sudo apt-get install -y --no-install-recommends "$p" || { warn "nao instalou: $p"; rc=1; }; done
+    return $rc
+}
+# "um ou outro": instala o primeiro nome da lista que existir neste release (renomeio/t64 entre releases).
+apt_um_ou_outro() {
+    local p
+    for p in "$@"; do
+        pkg_instalado "$p" && return 0
+        if apt_resolve "$p" >/dev/null; then apt_garante "$p"; return; fi
+    done
+    warn "nenhum destes existe neste release: $*"; return 1
 }
 # Repo apt de terceiro: baixa a chave e grava o .sources so se ainda nao existe.
 repo_apt() { # repo_apt nome url_chave uris suites components [arch]
@@ -127,9 +154,18 @@ repo_apt() { # repo_apt nome url_chave uris suites components [arch]
         "$uris" "$suites" "$comps" "$ARCH" "$nome" "$ext" | sudo tee "$f" >/dev/null
     APT_SUJO=true
 }
-# O repo de terceiro pode ainda nao ter a suite do release novo: cai para a anterior (noble).
-suite_ou_fallback() { # suite_ou_fallback url_Release
-    if TMO 20 curl -fsI "$1" >/dev/null 2>&1; then echo "$CODENAME"; else echo noble; fi
+# O repo de terceiro pode ainda nao ter a suite do release novo: tenta a do release, depois resolute, questing e noble.
+# A url vem com $CODENAME dentro e e trocada por cada suite. Segue redirect e recusa pagina de erro com status 200
+# (o packages.openvpn.net responde 301 para /error.html quando a suite nao existe).
+suite_ou_fallback() { # suite_ou_fallback url_com_CODENAME
+    local s u final
+    for s in "$CODENAME" resolute questing noble; do
+        u="${1//$CODENAME/$s}"
+        final="$(TMO 20 curl -fsIL -o /dev/null -w '%{url_effective}' "$u" 2>/dev/null)" || continue
+        case "$final" in *error.html*|"") continue ;; esac
+        echo "$s"; return 0
+    done
+    echo noble
 }
 APT_SUJO=false
 apt_update_se_sujo() { if $APT_SUJO; then TMO 600 sudo apt-get update -y && APT_SUJO=false; fi; }
@@ -148,14 +184,15 @@ etapa_apt() {
     # base e build
     apt_garante build-essential git curl wget ca-certificates gnupg unzip zip jq tmux zsh vim \
         software-properties-common apt-transport-https lsb-release pkg-config openssl age \
-        ripgrep fd-find fzf tree htop net-tools dnsutils iproute2 rsync xclip \
+        ripgrep fd-find fzf tree htop net-tools bind9-dnsutils iproute2 rsync xclip \
         openssh-client openssh-server gpg-agent dconf-cli \
         python3 python3-venv python3-pip python3-dev pipx \
         dkms "linux-headers-$(uname -r)" linux-headers-generic \
-        libfuse2t64 fuse3 \
+        fuse3 \
         network-manager network-manager-openvpn network-manager-openvpn-gnome openvpn \
         ffmpeg libportaudio2 libsndfile1 espeak-ng pulseaudio-utils v4l-utils \
         libnss3-tools bash-completion shellcheck remmina remmina-plugin-rdp fastfetch
+    apt_um_ou_outro libfuse2t64 libfuse2 || warn "libfuse2 nao instalou (AppImage)"
     # ferramentas de uso diario que estao nesta maquina (apt-mark showmanual): rede, arquivos, escritorio
     apt_garante aria2 cifs-utils nfs-common samba-common-bin ntfs-3g lvm2 efibootmgr nmap whois traceroute \
         sshpass sqlite3 redis-server wireguard xrdp wl-clipboard fonts-firacode fprintd libpam-fprintd \
@@ -164,7 +201,7 @@ etapa_apt() {
 }
 
 #==============================================================================
-# 2. Docker (repo oficial; cai para a suite noble se a nova ainda nao existe)
+# 2. Docker (repo oficial; cai para resolute/questing/noble se a suite nova ainda nao existe)
 #==============================================================================
 etapa_docker() {
     if ! tem docker; then
@@ -462,6 +499,7 @@ conserta_evdi() {
     if lsmod | grep -q '^evdi ' && systemctl is-active --quiet displaylink-driver.service 2>/dev/null; then
         skip "evdi carregado e displaylink-driver ativo"; return 0
     fi
+    [ -e "/lib/modules/$k/build" ] || warn "sem headers do kernel em uso ($k): reinicie no kernel mais novo e rode --so displaylink."
     info "recompilando evdi $ver para $k"
     sudo systemctl stop displaylink-driver.service 2>/dev/null || true
     sudo modprobe -r evdi 2>/dev/null || true
@@ -527,7 +565,9 @@ etapa_zram() {
 }
 
 #==============================================================================
-# 10. Playwright e as libs do WebKit (faltam no 26.04)
+# 10. Playwright e as libs do WebKit (faltam no 26.04/26.10)
+#     O playwright-core 1.65 trata qualquer 26.x como ubuntu26.04 (lista de pacotes e build do WebKit);
+#     no 26.10 ele avisa 'plataforma nao oficial', e esperado. Os 79 pacotes da lista existem no 26.10.
 #==============================================================================
 etapa_playwright() {
     export NVM_DIR="$HOME/.nvm"

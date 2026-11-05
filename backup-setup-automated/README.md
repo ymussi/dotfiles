@@ -1,6 +1,6 @@
 # backup-setup-automated
 
-Backup completo e setup de uma máquina Ubuntu 26.04 LTS (dev/DevOps + harness de agentes).
+Backup completo e setup de uma máquina Ubuntu 26.10 "Stonking Stingray" (dev/DevOps + harness de agentes). O 26.04 LTS também é aceito.
 
 | Script | O que faz |
 |---|---|
@@ -19,7 +19,7 @@ Backup completo e setup de uma máquina Ubuntu 26.04 LTS (dev/DevOps + harness d
 # 3. desmonte e remonte o disco, depois confira (sha256 + decifra + conta as entradas do tar contra o MANIFESTO)
 ./backup.sh --verificar /run/media/$USER/<disco>/backup-ubuntu-<host>-<data>
 
-# 4. máquina nova (Ubuntu 26.04 recém-instalado, disco montado)
+# 4. máquina nova (Ubuntu 26.10 recém-instalado, disco montado)
 ./ubuntu-setup-automated.sh --restore /run/media/$USER/<disco>/backup-ubuntu-<host>-<data>
 ```
 
@@ -62,7 +62,9 @@ O destino não pode estar num repo git nem no HOME: o arquivo leva segredos.
 extensões do VS Code e do Kiro, pip, uv, pipx, gh, dconf, cron) → `projetos` (clona os repos que não estavam no tar) →
 `harness` (clona `dotfiles-claude`, roda o `install.sh`, liga linger e as units que estavam ligadas).
 
-Cada etapa confere o estado antes de agir; rodar de novo só refaz o que falta. Repos de terceiros sem a suite do Ubuntu novo caem para a `noble`.
+Cada etapa confere o estado antes de agir; rodar de novo só refaz o que falta. Repos de terceiros sem a suite do Ubuntu novo caem para a primeira que existir entre `resolute`, `questing` e `noble` (a checagem segue redirect e recusa página de erro). Pacote do apt que não existe no release é pulado com aviso, e se a instalação em lote falhar o script tenta um a um.
+
+Conferido em 05/11/2026 contra o índice `stonking` do archive: Docker e Tailscale têm suite própria; HashiCorp e OpenVPN3 ainda não (HashiCorp cai para `resolute`, OpenVPN3 para `resolute`); gh, Chrome, VS Code, NodeSource e DisplayLink usam suite fixa (`stable`/`nodistro`), sem depender do release.
 
 ### Pré-requisitos do harness (`dotfiles-claude`, privado)
 
