@@ -1,1244 +1,683 @@
 #!/usr/bin/env bash
-
 #==============================================================================
-# Ubuntu DevOps Setup Script - AUTOMATED VERSION
-# Para: Ubuntu 24.04 LTS
-# Atualizado: Julho 2026
-# Modo: Totalmente automatizado - sem interrupções
+# ubuntu-setup-automated.sh - setup de uma maquina Ubuntu 26.04 LTS do zero
+# (dev/DevOps + harness de agentes), idempotente.
 #
 # Uso:
-#   ./ubuntu-setup-automated.sh [caminho-do-backup]
+#   ./ubuntu-setup-automated.sh [opcoes]
 #
-#   caminho-do-backup   Diretorio gerado pelo backup.sh (contem dotfiles/,
-#                       secrets.tar.gpg, inventory/, data/). Se omitido, o
-#                       script procura automaticamente por algo em
-#                       $HOME/ubuntu-backup/* e usa o mais recente. Se nada
-#                       for encontrado, segue com defaults genericos (gera
-#                       chave SSH nova, cria ambiente conda generico, etc).
+#   --restore CAMINHO   restaura o backup cifrado gerado pelo backup.sh.
+#                       CAMINHO e a pasta backup-ubuntu-<host>-<data> (ou o
+#                       backup.tar.gpg dentro dela). A senha e pedida na hora.
+#   --auto-restore      procura backup-ubuntu-* em /media/$USER/* e usa o mais novo.
+#   --sem-harness       nao clona o dotfiles-claude nem roda o install.sh dele.
+#   --sem-displaylink   pula o driver DisplayLink (dock USB).
+#   --sem-projetos      no restore, nao re-clona os repos de ~/projects.
+#   --pular ETAPA       pula uma etapa (repetivel). Nomes: apt docker node uv gh aws
+#                       terraform kubectl cli-extra kiro claude rclone tailscale vpn apps
+#                       displaylink zram playwright shell harness
+#   --so ETAPA          roda so a etapa (repetivel; "restore" tambem vale).
+#   --listar            lista as etapas e sai.
+#   -h, --help
+#
+# Variaveis opcionais: GIT_USER_NAME, GIT_USER_EMAIL (so usadas se o backup nao
+# trouxe o ~/.gitconfig), ZRAM_ALGO_0/ZRAM_ALGO_1, ZRAM_MB_0/ZRAM_MB_1,
+# SWAP_FILE_GB (padrao 8), NODE_MAJOR (padrao 24), PY_VERSAO (padrao 3.12).
+#
+# Cada etapa checa o estado antes de agir: rodar de novo nao reinstala nem
+# sobrescreve nada. Falha numa etapa e registrada e o script segue; o resumo no
+# fim mostra o que falhou.
 #==============================================================================
-
+# shellcheck disable=SC2015,SC2016,SC2012
+# (A && B || C e usado de proposito para logar aviso e seguir; aspas simples em sh -c; ls -dt em glob de /media)
 set -uo pipefail
-# Nao usamos "set -e" global: cada etapa de instalacao roda dentro de uma
-# funcao chamada em contexto de teste (if funcao; then...), o que suspende
-# errexit so para aquela etapa e permite logar e seguir em frente em vez de
-# matar o script inteiro por causa de uma falha de rede/API pontual.
 
-# ============================================
-# CONFIGURAÇÕES FIXAS
-# ============================================
-GIT_USER_NAME="Yuri Mussi"
-GIT_USER_EMAIL="ymussi@gmail.com"
-GIT_EDITOR="vi"
-
-# Token opcional do GitHub para levantar o rate limit da API (evita falhas
-# esporadicas ao resolver "latest release" de k9s/stern/lazygit). Nao e
-# obrigatorio.
-GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+NODE_MAJOR="${NODE_MAJOR:-24}"
+PY_VERSAO="${PY_VERSAO:-3.12}"
+SWAP_FILE_GB="${SWAP_FILE_GB:-8}"
+ZRAM_MB_0="${ZRAM_MB_0:-4096}"; ZRAM_ALGO_0="${ZRAM_ALGO_0:-lzo-rle}"
+ZRAM_MB_1="${ZRAM_MB_1:-4096}"; ZRAM_ALGO_1="${ZRAM_ALGO_1:-zstd}"
+HARNESS_REPO="${HARNESS_REPO:-git@github.com:ymussi/dotfiles-claude.git}"
+HARNESS_DIR="${HARNESS_DIR:-$HOME/projects/dotfiles-claude}"
+META=".backup-ubuntu-meta"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1"; }
-skip()  { echo -e "${BLUE}[SKIP]${NC} $1"; }
-section() { echo ""; echo "=============================================="; echo "$1"; echo "=============================================="; echo ""; }
-
-# Roda uma funcao; se ela falhar, avisa e segue (nao mata o script).
-run_step() {
-    local desc="$1"; shift
-    if "$@"; then
-        return 0
-    else
-        warn "Etapa falhou, continuando mesmo assim: $desc"
-        return 1
-    fi
-}
-
-# Resolve a ultima tag de release de um repo GitHub, sem quebrar o script se
-# a API falhar/der rate limit (ex.: chamadas anonimas sao limitadas a 60/h).
-gh_latest_tag() {
-    local repo="$1"
-    local auth_header=()
-    [ -n "$GITHUB_TOKEN" ] && auth_header=(-H "Authorization: token $GITHUB_TOKEN")
-    curl -s "${auth_header[@]}" "https://api.github.com/repos/${repo}/releases/latest" \
-        | grep -oP '"tag_name": *"\K[^"]+' || true
-}
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[AVISO]${NC} $*"; }
+erro()  { echo -e "${RED}[ERRO]${NC} $*" >&2; }
+skip()  { echo -e "${BLUE}[OK-JA-FEITO]${NC} $*"; }
+secao() { echo; echo "=== $* ==="; }
 
 export DEBIAN_FRONTEND=noninteractive
-
-#==============================================================================
-# LOCALIZAR BACKUP
-#==============================================================================
-section "🚀 Iniciando Setup Automatizado"
-
-BACKUP_DIR_ARG="${1:-}"
-
-# Se um caminho foi passado explicitamente, ele TEM que existir e parecer um
-# backup de verdade - se nao, aborta com erro alto em vez de silenciosamente
-# cair em "modo sem backup" (que instala tudo do zero e nao restaura NADA:
-# SSH, AWS, kube, docker, gnupg, VPN, historico - sem avisar direito). Essa
-# era a causa mais provavel de AWS/VPN nao terem sido restaurados antes: um
-# path invalido so gerava 1 linha de aviso perdida no meio do log.
-if [ -n "$BACKUP_DIR_ARG" ]; then
-    if [ ! -d "$BACKUP_DIR_ARG" ]; then
-        echo ""
-        echo "############################################################"
-        echo "# ERRO FATAL: o caminho de backup informado nao existe:"
-        echo "#   $BACKUP_DIR_ARG"
-        echo "#"
-        echo "# Abortando de proposito - continuar significaria instalar"
-        echo "# tudo do zero SEM restaurar SSH/AWS/kube/docker/VPN/historico."
-        echo "# Confira o caminho (ls -la para ver o nome exato) e rode de novo."
-        echo "############################################################"
-        exit 1
-    fi
-    if [ ! -f "$BACKUP_DIR_ARG/secrets.tar.gpg" ] && [ ! -d "$BACKUP_DIR_ARG/dotfiles" ] && [ ! -d "$BACKUP_DIR_ARG/data" ]; then
-        echo ""
-        echo "############################################################"
-        echo "# ERRO FATAL: $BACKUP_DIR_ARG existe, mas nao parece um backup"
-        echo "# gerado pelo backup.sh (faltam secrets.tar.gpg, dotfiles/ e"
-        echo "# data/). Confira se o caminho e a pasta RAIZ do backup, nao"
-        echo "# uma subpasta dela."
-        echo "############################################################"
-        exit 1
-    fi
-    BACKUP_DIR="$BACKUP_DIR_ARG"
-    HAS_BACKUP=true
-    info "📦 Backup: $BACKUP_DIR"
-else
-    CANDIDATE="$(ls -dt "$HOME"/ubuntu-backup/*/ 2>/dev/null | head -1 || true)"
-    if [ -n "$CANDIDATE" ]; then
-        BACKUP_DIR="${CANDIDATE%/}"
-        HAS_BACKUP=true
-        info "Nenhum backup informado, usando o mais recente encontrado: $BACKUP_DIR"
-    else
-        BACKUP_DIR=""
-        HAS_BACKUP=false
-        echo ""
-        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        echo "!! NENHUM BACKUP ENCONTRADO (nem argumento, nem ~/ubuntu-backup/*)   !!"
-        echo "!! Este setup vai rodar em modo GENÉRICO: chave SSH nova, ambiente   !!"
-        echo "!! conda genérico, SEM SSH/AWS/kube/docker/gnupg/VPN/histórico       !!"
-        echo "!! restaurados. Se você esperava restaurar seu backup, cancele       !!"
-        echo "!! agora (Ctrl+C) e rode de novo passando o caminho correto.         !!"
-        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        echo ""
-        sleep 5
-    fi
-fi
-
-info "Usuário: $GIT_USER_NAME"
-info "Email: $GIT_USER_EMAIL"
-info "Editor: $GIT_EDITOR"
-echo ""
-
-#==============================================================================
-# ATUALIZAR SISTEMA
-#==============================================================================
-section "Atualizando sistema"
-
-sudo rm -f /etc/apt/sources.list.d/spotify.list 2>/dev/null || true
-sudo rm -f /etc/apt/trusted.gpg.d/spotify.gpg 2>/dev/null || true
-
-sudo apt-get update
-sudo apt-get upgrade -y
-
-#==============================================================================
-# FERRAMENTAS BÁSICAS
-#==============================================================================
-section "Instalando ferramentas básicas"
-
-sudo apt-get install -y \
-    curl wget git build-essential apt-transport-https ca-certificates \
-    software-properties-common gnupg lsb-release jq unzip vim rsync \
-    fonts-firacode xclip dconf-cli 2>/dev/null || true
-
-info "✅ Ferramentas básicas instaladas"
-
-#==============================================================================
-# GIT CONFIGURATION
-#==============================================================================
-section "Configurando Git"
-
-git config --global user.name "$GIT_USER_NAME"
-git config --global user.email "$GIT_USER_EMAIL"
-git config --global core.editor "$GIT_EDITOR"
-git config --global pull.rebase false
-git config --global init.defaultBranch main
-git config --global core.autocrlf input
-
-info "✅ Git configurado"
-
-#==============================================================================
-# RESTAURAR SEGREDOS (SSH, AWS, kube, docker, gnupg, terraform, zsh_secrets)
-#==============================================================================
-section "Restaurando segredos e credenciais"
-
-mkdir -p ~/.ssh ~/.aws ~/.kube ~/.docker
-chmod 700 ~/.ssh ~/.aws
-
-# Necessario para o prompt de senha do gpg funcionar de forma confiavel
-# quando chamado de dentro de um script (sem isso, gpg-agent as vezes nao
-# acha o terminal certo pra pedir a senha e falha silenciosamente).
-export GPG_TTY="$(tty 2>/dev/null || true)"
-
-restore_secrets() {
-    local secrets_tar="$BACKUP_DIR/secrets.tar.gpg"
-    [ -f "$secrets_tar" ] || { warn "secrets.tar.gpg não encontrado no backup, pulando restauração de segredos."; return 1; }
-
-    local stage; stage="$(mktemp -d)"
-    # Ate 3 tentativas de senha. IMPORTANTE: lemos a senha explicitamente com
-    # "read -s" e passamos via --passphrase (igual o backup.sh faz na hora de
-    # criptografar), em vez de deixar o gpg tentar pedir a senha sozinho via
-    # --pinentry-mode loopback sem --passphrase - isso pode falhar
-    # silenciosamente dependendo do terminal/gpg-agent (prompt do gpg vai pro
-    # stderr e nunca aparece, ou o gpg nem chega a perguntar nada). Tambem
-    # mostramos o erro real do gpg em vez de esconder com 2>/dev/null, para
-    # nao mascarar um problema tecnico como se fosse "senha errada".
-    local tentativa ok=false RESTORE_PASS
-    for tentativa in 1 2 3; do
-        read -r -s -p "Digite a senha usada no backup.sh para descriptografar os segredos (tentativa $tentativa/3): " RESTORE_PASS
-        echo
-        if [ -z "$RESTORE_PASS" ]; then
-            error "Senha vazia, tente de novo."
-            continue
-        fi
-        if gpg --batch --yes --pinentry-mode loopback --passphrase "$RESTORE_PASS" \
-            -o "$stage/secrets.tar" -d "$secrets_tar" 2>"$stage/gpg_err.log"; then
-            ok=true
-            unset RESTORE_PASS
-            break
-        else
-            error "Falha ao descriptografar (senha incorreta ou outro erro abaixo):"
-            sed 's/^/    /' "$stage/gpg_err.log" >&2
-            rm -f "$stage/secrets.tar"
-        fi
-        unset RESTORE_PASS
-    done
-    if [ "$ok" != true ]; then
-        error "############################################################"
-        error "# FALHA: nao foi possivel descriptografar secrets.tar.gpg"
-        error "# apos 3 tentativas. SSH, AWS, kube, docker, gnupg,"
-        error "# terraform.d, zsh_secrets, DBeaver, VPN, Claude Code e"
-        error "# historico do zsh NAO foram restaurados nesta execucao."
-        error "# Recupere depois com: gpg -d $secrets_tar | tar -tv"
-        error "############################################################"
-        rm -rf "$stage"
-        return 1
-    fi
-    tar -C "$stage" -xf "$stage/secrets.tar"
-    rm -f "$stage/secrets.tar"
-
-    # rsync -a --update em vez de cp: so toca o que e novo/diferente do que
-    # ja existe no disco, e nunca sobrescreve um arquivo local mais recente
-    # (ex: se voce ja tiver editado algo depois de um restore anterior).
-    # Isso torna o restore seguro de rodar mais de uma vez (idempotente).
-    [ -d "$stage/ssh" ]    && rsync -a --update "$stage/ssh/" ~/.ssh/
-    [ -d "$stage/aws" ]    && rsync -a --update "$stage/aws/" ~/.aws/
-    [ -f "$stage/kube/config" ] && rsync -a --update "$stage/kube/config" ~/.kube/config
-    [ -f "$stage/docker/config.json" ] && { mkdir -p ~/.docker; rsync -a --update "$stage/docker/config.json" ~/.docker/config.json; }
-    [ -d "$stage/gnupg" ]  && rsync -a --update "$stage/gnupg/" ~/.gnupg/
-    [ -d "$stage/terraform.d" ] && { mkdir -p ~/.terraform.d; rsync -a --update "$stage/terraform.d/" ~/.terraform.d/; }
-    [ -f "$stage/zsh_secrets" ] && rsync -a --update "$stage/zsh_secrets" ~/.zsh_secrets
-    [ -f "$stage/extra/tfc-github-key" ] && rsync -a --update "$stage/extra/tfc-github-key" ~/tfc-github-key
-    [ -f "$stage/extra/tfc-github-key.pub" ] && rsync -a --update "$stage/extra/tfc-github-key.pub" ~/tfc-github-key.pub
-    [ -f "$stage/extra/.terraformrc" ] && rsync -a --update "$stage/extra/.terraformrc" ~/.terraformrc
-    if [ -f "$stage/gh/hosts.yml" ]; then
-        mkdir -p ~/.config/gh
-        rsync -a --update "$stage/gh/hosts.yml" ~/.config/gh/hosts.yml
-        chmod 600 ~/.config/gh/hosts.yml
-    fi
-    if [ -d "$stage/dbeaver/DBeaverData" ]; then
-        mkdir -p ~/.local/share
-        rsync -a --update "$stage/dbeaver/DBeaverData/" ~/.local/share/DBeaverData/
-        info "✓ conexões do DBeaver restauradas"
-    fi
-    if [ -f "$stage/claude/.claude.json" ]; then
-        rsync -a --update "$stage/claude/.claude.json" ~/.claude.json
-        chmod 600 ~/.claude.json
-    fi
-    if [ -d "$stage/claude/dotclaude" ]; then
-        mkdir -p ~/.claude
-        rsync -a --update "$stage/claude/dotclaude/" ~/.claude/
-        chmod 600 ~/.claude/.credentials.json 2>/dev/null || true
-        info "✓ Claude Code restaurado (histórico de conversas + credenciais)"
-    fi
-    if [ -f "$stage/history/.zsh_history" ]; then
-        rsync -a --update "$stage/history/.zsh_history" ~/.zsh_history
-        chmod 600 ~/.zsh_history
-        info "✓ histórico do zsh restaurado"
-    fi
-    [ -f "$stage/history/.bash_history" ] && { rsync -a --update "$stage/history/.bash_history" ~/.bash_history; chmod 600 ~/.bash_history; }
-    # Perfis openvpn3 so podem ser importados depois que o pacote "openvpn3"
-    # estiver instalado (mais adiante no script), entao so guardamos os
-    # arquivos .ovpn aqui num lugar persistente e importamos depois.
-    if [ -d "$stage/openvpn3" ]; then
-        mkdir -p ~/.cache/openvpn3-profiles-to-import
-        rsync -a "$stage/openvpn3/" ~/.cache/openvpn3-profiles-to-import/
-    fi
-    # Certificados TLS das VPNs do NetworkManager (cliente cert+key+ca) - sao
-    # arquivos de usuario normais, restauram junto com o resto.
-    if [ -d "$stage/cert/nm-openvpn" ]; then
-        mkdir -p ~/.cert
-        rsync -a --update "$stage/cert/nm-openvpn/" ~/.cert/nm-openvpn/
-        info "✓ certificados de VPN (NetworkManager) restaurados"
-    fi
-    # As conexoes VPN do NetworkManager (.ovpn exportado) so podem ser
-    # importadas depois que o plugin network-manager-openvpn estiver
-    # instalado (mais adiante), entao so guardamos aqui pra importar depois.
-    if [ -d "$stage/networkmanager-vpn" ]; then
-        mkdir -p ~/.cache/nm-vpn-profiles-to-import
-        rsync -a "$stage/networkmanager-vpn/" ~/.cache/nm-vpn-profiles-to-import/
-    fi
-
-    # Permissões corretas
-    chmod 700 ~/.ssh ~/.aws ~/.gnupg 2>/dev/null || true
-    find ~/.ssh -type f ! -name "*.pub" -exec chmod 600 {} \; 2>/dev/null || true
-    find ~/.ssh -type f -name "*.pub" -exec chmod 644 {} \; 2>/dev/null || true
-    chmod 600 ~/.aws/credentials ~/.aws/config 2>/dev/null || true
-    chmod 600 ~/.zsh_secrets ~/tfc-github-key 2>/dev/null || true
-
-    # Adiciona todas as chaves privadas encontradas (nomes variam por projeto)
-    eval "$(ssh-agent -s)" >/dev/null 2>&1
-    for key in ~/.ssh/*; do
-        base="$(basename "$key")"
-        case "$base" in
-            *.pub|config|known_hosts|known_hosts.old|authorized_keys) continue ;;
-        esac
-        ssh-add "$key" 2>/dev/null && info "✓ chave SSH adicionada: $base"
-    done
-
-    rm -rf "$stage"
-    info "✅ Segredos restaurados (SSH, AWS, kube, docker, gnupg, terraform, zsh_secrets)"
-    return 0
-}
-
-SECRETS_RESTORED=false
-if [ "$HAS_BACKUP" = true ]; then
-    if run_step "restaurar segredos do backup" restore_secrets; then
-        SECRETS_RESTORED=true
-    else
-        echo ""
-        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        echo "!! ATENÇÃO: os segredos (SSH/AWS/kube/docker/gnupg/terraform/ !!"
-        echo "!! DBeaver/VPN/Claude/histórico do zsh) NÃO foram restaurados !!"
-        echo "!! O script vai continuar instalando tudo, mas confira a      !!"
-        echo "!! seção de verificação final no fim deste log.               !!"
-        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        echo ""
-    fi
-fi
-
-# Gerar chave SSH se, mesmo depois da restauração, nao existir nenhuma
-if ! ls ~/.ssh/*.pub >/dev/null 2>&1; then
-    info "Nenhuma chave SSH encontrada, gerando uma nova..."
-    ssh-keygen -t ed25519 -C "$GIT_USER_EMAIL" -f ~/.ssh/id_ed25519 -N "" -q
-    eval "$(ssh-agent -s)" >/dev/null 2>&1
-    ssh-add ~/.ssh/id_ed25519 2>/dev/null
-    echo ""
-    echo "====== SUA CHAVE SSH PÚBLICA (adicione no GitHub/GitLab) ======"
-    cat ~/.ssh/id_ed25519.pub
-    echo "==============================================================="
-    echo ""
-else
-    info "✅ Chaves SSH presentes em ~/.ssh"
-fi
-
-#==============================================================================
-# ZSH & OH-MY-ZSH
-#==============================================================================
-section "Instalando ZSH e Oh-My-Zsh"
-
-if ! command -v zsh &> /dev/null; then
-    sudo apt-get install -y zsh
-    info "✅ ZSH instalado"
-else
-    skip "ZSH já instalado"
-fi
-
-if [ ! -d ~/.oh-my-zsh ]; then
-    info "Instalando Oh-My-Zsh..."
-    RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended > /dev/null 2>&1 || true
-    info "✅ Oh-My-Zsh instalado"
-else
-    skip "Oh-My-Zsh já instalado"
-fi
-
-install_zsh_plugin() {
-    local name="$1" url="$2"
-    local dest=~/.oh-my-zsh/custom/plugins/"$name"
-    if [ ! -d "$dest" ]; then
-        git clone --depth 1 "$url" "$dest"
-    fi
-}
-run_step "plugin zsh-autosuggestions" install_zsh_plugin zsh-autosuggestions https://github.com/zsh-users/zsh-autosuggestions
-run_step "plugin zsh-syntax-highlighting" install_zsh_plugin zsh-syntax-highlighting https://github.com/zsh-users/zsh-syntax-highlighting
-
-# Se temos um .zshrc real no backup, usamos ele (preserva TODAS as
-# customizações, aliases e o source de ~/.zsh_secrets). So cai no template
-# generico abaixo se nao ha backup.
-if [ "$HAS_BACKUP" = true ] && [ -f "$BACKUP_DIR/dotfiles/.zshrc" ]; then
-    rsync -a --update "$BACKUP_DIR/dotfiles/.zshrc" ~/.zshrc
-    info "✅ .zshrc restaurado do backup (preferências originais preservadas)"
-else
-cat > ~/.zshrc << 'ZSHRC_EOF'
-# Path to your Oh My Zsh installation.
-export ZSH="$HOME/.oh-my-zsh"
-
-# Theme
-ZSH_THEME="robbyrussell"
-
-# Plugins
-plugins=(
-    aws
-    git
-    docker
-    kubectl
-    terraform
-    zsh-syntax-highlighting
-    zsh-autosuggestions
-)
-
-source $ZSH/oh-my-zsh.sh
-
-# ============================================
-# Custom Aliases - Yuri Mussi DevOps
-# ============================================
-
-alias s='source ~/.zshrc'
-
-# System aliases
-alias ls='ls -lha'
-alias ll='ls -lha'
-alias la='ls -la'
-alias ..='cd ..'
-alias ...='cd ../..'
-alias atualizar='sudo apt update && sudo apt upgrade -y && sudo apt autoremove -y && sudo apt autoclean'
-alias myip='curl ifconfig.me'
-
-# Git aliases
-alias gs='git status'
-alias ga='git add'
-alias gc='git commit -m'
-alias gp='git push'
-alias gl='git pull'
-alias gco='git checkout'
-alias gb='git branch'
-alias glog='git log --oneline --graph --decorate'
-alias lg='lazygit'
-
-# Docker aliases (docker-compose standalone nao existe mais - e plugin "docker compose")
-alias d='docker'
-alias dc='docker compose'
-alias dps='docker ps'
-alias di='docker images'
-alias dex='docker exec -it'
-alias dlog='docker logs -f'
-alias dprune='docker system prune -af'
-
-# Kubernetes aliases
-alias k='kubectl'
-alias kgp='kubectl get pods'
-alias kgs='kubectl get svc'
-alias kgd='kubectl get deploy'
-alias kl='kubectl logs -f'
-alias kex='kubectl exec -it'
-alias kctx='kubectx'
-alias kns='kubens'
-
-# Terraform aliases
-alias tf='terraform'
-alias tfi='terraform init'
-alias tfp='terraform plan'
-alias tfa='terraform apply'
-alias tfd='terraform destroy'
-alias tfv='terraform validate'
-alias tff='terraform fmt -recursive'
-
-# AWS aliases
-alias awsp='export AWS_PROFILE='
-alias awsl='aws configure list-profiles'
-
-# Jupyter aliases
-alias jlab='conda activate jupyter && jupyter lab'
-alias jnb='conda activate jupyter && jupyter notebook'
-alias deact='conda deactivate'
-alias condaoff='conda deactivate'
-
-# Segredos (senhas, API keys) ficam fora do controle de versão
-[ -f ~/.zsh_secrets ] && source ~/.zsh_secrets
-
-# Funções úteis
-awslogin() {
-    aws sso login --profile $1
-}
-
-kubeconfig() {
-    export KUBECONFIG=~/.kube/$1
-}
-
-parse_git_branch() {
-    git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/(\1)/'
-}
-
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
-
-export PATH="$HOME/.local/bin:$PATH"
-ZSHRC_EOF
-    info "✅ .zshrc genérico criado (nenhum backup disponível)"
-fi
-
-# Restaura os DEMAIS dotfiles do backup (o .zshrc já foi tratado acima).
-# Lista explicita (nao glob "dotfiles/*"): todo arquivo aqui comeca com "."
-# e um glob "*" sem dotglob nao casaria com nenhum - mesma classe de bug
-# corrigida antes no "ls" do manifesto, aqui seria pior (silenciosamente
-# nao restauraria nada).
-if [ "$HAS_BACKUP" = true ] && [ -d "$BACKUP_DIR/dotfiles" ]; then
-    OUTROS_DOTFILES=(.bashrc .bash_profile .bash_aliases .profile .gitconfig .condarc .npmrc .vimrc .fzf.zsh .fzf.bash .zshrc.local)
-    for f in "${OUTROS_DOTFILES[@]}"; do
-        [ -f "$BACKUP_DIR/dotfiles/$f" ] && rsync -a --update "$BACKUP_DIR/dotfiles/$f" "$HOME/$f" && info "✓ $f restaurado"
-    done
-    if [ -f "$BACKUP_DIR/dotfiles/ssh_config" ]; then
-        mkdir -p ~/.ssh
-        rsync -a --update "$BACKUP_DIR/dotfiles/ssh_config" ~/.ssh/config
-        chmod 600 ~/.ssh/config
-        info "✓ ~/.ssh/config restaurado"
-    fi
-fi
-
-if [ "$SHELL" != "$(which zsh)" ]; then
-    info "Configurando ZSH como shell padrão..."
-    sudo usermod -s "$(which zsh)" "$USER"
-    info "✅ ZSH configurado como shell padrão (aplica após novo login)"
-fi
-
-#==============================================================================
-# FZF
-#==============================================================================
-section "Instalando FZF"
-
-if [ ! -d ~/.fzf ]; then
-    git clone --depth 1 https://github.com/junegunn/fzf.git ~/.fzf
-    yes | ~/.fzf/install --all --no-bash --no-fish --key-bindings --completion --no-update-rc
-    info "✅ FZF instalado"
-else
-    skip "FZF já instalado"
-fi
-
-#==============================================================================
-# PYTHON
-#==============================================================================
-section "Instalando Python"
-
-sudo apt-get install -y python3 python3-pip python3-venv python3-dev
-info "✅ Python instalado"
-
-#==============================================================================
-# MINICONDA & AMBIENTES CONDA
-#==============================================================================
-section "Instalando Miniconda"
-
-if [ ! -d "$HOME/miniconda3" ]; then
-    wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
-    bash /tmp/miniconda.sh -b -p "$HOME/miniconda3"
-    rm /tmp/miniconda.sh
-
-    "$HOME/miniconda3/bin/conda" init bash > /dev/null
-    "$HOME/miniconda3/bin/conda" init zsh > /dev/null
-    "$HOME/miniconda3/bin/conda" config --set channel_priority flexible
-    "$HOME/miniconda3/bin/conda" config --set auto_activate_base false
-    info "✅ Miniconda instalado"
-else
-    skip "Miniconda já instalado"
-fi
-
-CONDA_BIN="$HOME/miniconda3/bin/conda"
-
-restore_conda_envs() {
-    local any=false
-    for yml in "$BACKUP_DIR"/inventory/conda/*.yml; do
-        [ -f "$yml" ] || continue
-        any=true
-        local env_name; env_name="$(basename "$yml" .yml)"
-        if "$CONDA_BIN" env list 2>/dev/null | grep -q "^${env_name} "; then
-            skip "conda env '$env_name' já existe"
-        else
-            info "Recriando conda env '$env_name' a partir do backup..."
-            "$CONDA_BIN" env create -f "$yml" 2>&1 | tail -5 || warn "Falha ao recriar env '$env_name'"
-        fi
-    done
-    [ "$any" = true ]
-}
-
-if [ "$HAS_BACKUP" = true ] && ls "$BACKUP_DIR"/inventory/conda/*.yml >/dev/null 2>&1; then
-    run_step "restaurar ambientes conda do backup" restore_conda_envs
-else
-    if ! "$CONDA_BIN" env list 2>/dev/null | grep -q "^jupyter "; then
-        info "Nenhum backup de conda encontrado, criando ambiente genérico 'jupyter'..."
-        "$CONDA_BIN" create -n jupyter python=3.11 -y
-        source "$HOME/miniconda3/bin/activate" jupyter
-        "$CONDA_BIN" install -y -c conda-forge jupyter jupyterlab notebook pandas numpy matplotlib seaborn scikit-learn boto3 requests
-        pip install jupyterlab-git ipywidgets
-        conda deactivate
-        info "✅ Ambiente 'jupyter' criado"
-    fi
-fi
-
-#==============================================================================
-# NODE.JS (via NVM)
-#==============================================================================
-section "Instalando Node.js via NVM"
-
-if [ ! -d "$HOME/.nvm" ]; then
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
-fi
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-
-NODE_TARGET="--lts"
-if [ "$HAS_BACKUP" = true ] && [ -f "$BACKUP_DIR/inventory/node-version.txt" ]; then
-    NODE_TARGET="$(cat "$BACKUP_DIR/inventory/node-version.txt")"
-fi
-nvm install "$NODE_TARGET" >/dev/null 2>&1 || nvm install --lts
-nvm alias default "$(nvm current)" >/dev/null 2>&1 || true
-info "✅ Node.js $(node --version 2>/dev/null) instalado"
-
-restore_npm_globals() {
-    local list="$BACKUP_DIR/inventory/npm-global.txt"
-    [ -f "$list" ] || return 1
-    while IFS= read -r pkg; do
-        [ -z "$pkg" ] && continue
-        case "$pkg" in npm|corepack) continue ;; esac
-        npm install -g "$pkg" >/dev/null 2>&1 && info "✓ npm -g $pkg" || warn "Falha ao instalar npm -g $pkg"
-    done < "$list"
-    return 0
-}
-
-if [ "$HAS_BACKUP" = true ]; then
-    run_step "restaurar pacotes npm globais" restore_npm_globals
-fi
-
-# Garantia extra: gemini-cli e usado direto (alias "gem") e pode ter sido
-# instalado na maquina de origem via npm do sistema (fora do nvm), o que o
-# backup antigo pode nao ter capturado - reinstala aqui independente do
-# inventario, e' idempotente.
-if ! command -v gemini >/dev/null 2>&1; then
-    npm install -g @google/gemini-cli >/dev/null 2>&1 && info "✓ gemini-cli instalado" || warn "Falha ao instalar gemini-cli"
-else
-    skip "gemini-cli já instalado"
-fi
-
-#==============================================================================
-# AWS CLI V2
-#==============================================================================
-section "Instalando AWS CLI v2"
-
-if ! command -v aws &> /dev/null; then
-    curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
-    unzip -q /tmp/awscliv2.zip -d /tmp/
-    sudo /tmp/aws/install --update
-    rm -rf /tmp/aws /tmp/awscliv2.zip
-
-    curl -s "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "/tmp/session-manager.deb"
-    sudo dpkg -i /tmp/session-manager.deb > /dev/null
-    rm /tmp/session-manager.deb
-
-    info "✅ AWS CLI $(aws --version) instalado"
-else
-    skip "AWS CLI já instalado"
-fi
-
-#==============================================================================
-# DOCKER
-#==============================================================================
-section "Instalando Docker"
-
-if ! command -v docker &> /dev/null; then
-    sudo install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    sudo chmod a+r /etc/apt/keyrings/docker.gpg
-
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-      sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-    sudo apt-get update
-    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    sudo usermod -aG docker "$USER"
-
-    info "✅ Docker $(docker --version) instalado (docker compose via plugin, sem hífen)"
-else
-    skip "Docker já instalado"
-fi
-
-#==============================================================================
-# TERRAFORM
-#==============================================================================
-section "Instalando Terraform"
-
-if ! command -v terraform &> /dev/null; then
-    wget -qO- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list > /dev/null
-    sudo apt-get update
-    sudo apt-get install -y terraform
-    info "✅ Terraform $(terraform --version | head -1) instalado"
-else
-    skip "Terraform já instalado"
-fi
-
-#==============================================================================
-# KUBECTL
-#==============================================================================
-section "Instalando kubectl"
-
-install_kubectl() {
-    local ver; ver="$(curl -Ls https://dl.k8s.io/release/stable.txt)"
-    [ -n "$ver" ] || return 1
-    curl -Ls "https://dl.k8s.io/release/${ver}/bin/linux/amd64/kubectl" -o /tmp/kubectl
-    sudo install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-    rm -f /tmp/kubectl
-}
-
-if ! command -v kubectl &> /dev/null; then
-    run_step "instalar kubectl" install_kubectl && info "✅ kubectl instalado"
-else
-    skip "kubectl já instalado"
-fi
-
-#==============================================================================
-# HELM
-#==============================================================================
-section "Instalando Helm"
-
-if ! command -v helm &> /dev/null; then
-    run_step "instalar helm" bash -c 'curl -s https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash >/dev/null 2>&1' \
-        && info "✅ Helm instalado"
-else
-    skip "Helm já instalado"
-fi
-
-#==============================================================================
-# K9S
-#==============================================================================
-section "Instalando k9s"
-
-install_k9s() {
-    local arch; arch="$(uname -m)"
-    local k9s_arch="amd64"
-    [ "$arch" = "aarch64" ] && k9s_arch="arm64"
-
-    local version; version="$(gh_latest_tag derailed/k9s)"
-    if [ -z "$version" ]; then
-        warn "Não consegui resolver a última versão do k9s (rate limit da API do GitHub?). Pulando."
-        return 1
-    fi
-    wget -q "https://github.com/derailed/k9s/releases/download/${version}/k9s_Linux_${k9s_arch}.tar.gz" -O /tmp/k9s.tar.gz
-    tar -xzf /tmp/k9s.tar.gz -C /tmp k9s
-    sudo mv /tmp/k9s /usr/local/bin/
-    rm -f /tmp/k9s.tar.gz
-}
-
-if ! command -v k9s &> /dev/null; then
-    run_step "instalar k9s" install_k9s && info "✅ k9s instalado"
-else
-    skip "k9s já instalado"
-fi
-
-#==============================================================================
-# ARGOCD CLI
-#==============================================================================
-section "Instalando ArgoCD CLI"
-
-install_argocd() {
-    curl -sSL -o /tmp/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-    sudo install -m 555 /tmp/argocd /usr/local/bin/argocd
-    rm -f /tmp/argocd
-}
-
-if ! command -v argocd &> /dev/null; then
-    run_step "instalar argocd" install_argocd && info "✅ ArgoCD CLI instalado"
-else
-    skip "ArgoCD CLI já instalado"
-fi
-
-#==============================================================================
-# GITHUB CLI (gh) - para auth não-interativa via hosts.yml restaurado
-#==============================================================================
-section "Instalando GitHub CLI"
-
-if ! command -v gh &> /dev/null; then
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-    sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-    sudo apt-get update
-    sudo apt-get install -y gh
-    info "✅ GitHub CLI instalado"
-else
-    skip "GitHub CLI já instalado"
-fi
-
-if command -v gh &>/dev/null && gh auth status &>/dev/null; then
-    gh auth setup-git 2>/dev/null || true
-    info "✅ gh já autenticado (restaurado do backup) - git via HTTPS configurado"
-else
-    warn "gh não autenticado. Se preferir HTTPS ao invés de SSH para o GitHub, rode manualmente: gh auth login"
-fi
-
-#==============================================================================
-# CLAUDE CODE
-#==============================================================================
-section "Instalando Claude Code"
-
-if ! command -v claude &> /dev/null; then
-    install_claude_code() {
-        curl -fsSL https://claude.ai/install.sh | bash
-    }
-    run_step "instalar Claude Code" install_claude_code && info "✅ Claude Code instalado"
-else
-    skip "Claude Code já instalado"
-fi
-
-#==============================================================================
-# OPENVPN3 & XFREERDP3
-#==============================================================================
-section "Instalando OpenVPN3 e FreeRDP3"
-
-if ! command -v openvpn3 &> /dev/null; then
-    install_openvpn3() {
-        curl -fsSL https://packages.openvpn.net/packages-repo.gpg | sudo gpg --dearmor -o /usr/share/keyrings/openvpn.gpg
-        echo "deb [signed-by=/usr/share/keyrings/openvpn.gpg] https://packages.openvpn.net/openvpn3/debian $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/openvpn3.list > /dev/null
-        sudo apt-get update
-        sudo apt-get install -y openvpn3
-    }
-    run_step "instalar openvpn3" install_openvpn3 && info "✅ openvpn3 instalado"
-else
-    skip "openvpn3 já instalado"
-fi
-
-if ! command -v xfreerdp3 &> /dev/null; then
-    sudo apt-get install -y freerdp3-x11 && info "✅ freerdp3-x11 instalado" || warn "Falha ao instalar freerdp3-x11"
-else
-    skip "xfreerdp3 já instalado"
-fi
-
-# Importa perfis openvpn3 extraídos do backup (deixados em
-# ~/.cache/openvpn3-profiles-to-import pela etapa de restauração de segredos).
-if command -v openvpn3 >/dev/null 2>&1 && [ -d ~/.cache/openvpn3-profiles-to-import ]; then
-    for ovpn in ~/.cache/openvpn3-profiles-to-import/*.ovpn; do
-        [ -f "$ovpn" ] || continue
-        name="$(basename "$ovpn" .ovpn)"
-        # Backups antigos podem ter capturado a linha de separador ("---...")
-        # do "openvpn3 configs-list" como se fosse nome de perfil - ignora.
-        case "$name" in
-            -*) continue ;;
-        esac
-        if openvpn3 configs-list 2>/dev/null | grep -q "^${name} "; then
-            skip "perfil openvpn3 '$name' já existe"
-        else
-            openvpn3 config-import --config "$ovpn" --name "$name" --persistent >/dev/null 2>&1 \
-                && info "✓ perfil openvpn3 '$name' importado" \
-                || warn "Falha ao importar perfil openvpn3 '$name'"
-        fi
-    done
-    rm -rf ~/.cache/openvpn3-profiles-to-import
-fi
-
-#==============================================================================
-# NETWORKMANAGER VPN (plugin OpenVPN - Configurações > Rede > VPN)
-#==============================================================================
-section "Instalando plugin OpenVPN do NetworkManager"
-
-if ! dpkg -l network-manager-openvpn 2>/dev/null | grep -q "^ii"; then
-    sudo apt-get install -y network-manager-openvpn network-manager-openvpn-gnome \
-        && info "✅ network-manager-openvpn instalado" \
-        || warn "Falha ao instalar network-manager-openvpn"
-else
-    skip "network-manager-openvpn já instalado"
-fi
-
-# Importa conexões VPN do NetworkManager extraídas do backup. Os .ovpn
-# exportados referenciam os certificados pelo caminho absoluto da máquina de
-# origem (ex: /home/mussi/.cert/...) - se o usuário Linux for diferente aqui
-# (ex: yuri-mussi), reescrevemos o path antes de importar.
-if command -v nmcli >/dev/null 2>&1 && [ -d ~/.cache/nm-vpn-profiles-to-import ]; then
-    OLD_HOME="$(cat "$BACKUP_DIR/inventory/source-home.txt" 2>/dev/null || true)"
-    for ovpn in ~/.cache/nm-vpn-profiles-to-import/*.ovpn; do
-        [ -f "$ovpn" ] || continue
-        vpn_name="$(basename "$ovpn" .ovpn)"
-        if nmcli connection show "$vpn_name" >/dev/null 2>&1; then
-            skip "conexão NetworkManager VPN '$vpn_name' já existe"
-            continue
-        fi
-        fixed="${ovpn}.fixed"
-        if [ -n "$OLD_HOME" ] && [ "$OLD_HOME" != "$HOME" ]; then
-            sed "s#${OLD_HOME}#${HOME}#g" "$ovpn" > "$fixed"
-        else
-            cp "$ovpn" "$fixed"
-        fi
-        sudo nmcli connection import type openvpn file "$fixed" >/dev/null 2>&1 \
-            && info "✓ conexão NetworkManager VPN '$vpn_name' importada (usuário/senha serão pedidos na 1ª conexão)" \
-            || warn "Falha ao importar conexão NetworkManager VPN '$vpn_name'"
-    done
-    rm -rf ~/.cache/nm-vpn-profiles-to-import
-fi
-
-#==============================================================================
-# VSCODE
-#==============================================================================
-section "Instalando VS Code"
-
-if ! command -v code &> /dev/null; then
-    wget -q -O /tmp/packages.microsoft.gpg https://packages.microsoft.com/keys/microsoft.asc
-    gpg --dearmor < /tmp/packages.microsoft.gpg > /tmp/packages.microsoft.gpg.dearmored 2>/dev/null
-    sudo install -D -o root -g root -m 644 /tmp/packages.microsoft.gpg.dearmored /etc/apt/keyrings/packages.microsoft.gpg
-    sudo sh -c 'echo "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main" > /etc/apt/sources.list.d/vscode.list'
-    rm -f /tmp/packages.microsoft.gpg /tmp/packages.microsoft.gpg.dearmored
-
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq code
-    info "✅ VS Code instalado"
-else
-    skip "VS Code já instalado"
-fi
-
-install_vscode_extensions() {
-    local list="$BACKUP_DIR/inventory/vscode-extensions.txt"
-    [ -f "$list" ] || return 1
-    while IFS= read -r ext; do
-        [ -z "$ext" ] && continue
-        code --install-extension "$ext" --force > /dev/null 2>&1
-    done < "$list"
-    return 0
-}
-
-if [ "$HAS_BACKUP" = true ] && [ -f "$BACKUP_DIR/inventory/vscode-extensions.txt" ]; then
-    run_step "restaurar extensões do VS Code" install_vscode_extensions && info "✅ Extensões do VS Code restauradas do backup"
-else
-    for ext in ms-python.python ms-azuretools.vscode-docker hashicorp.terraform \
-               ms-kubernetes-tools.vscode-kubernetes-tools eamodio.gitlens \
-               esbenp.prettier-vscode dbaeumer.vscode-eslint ms-vscode-remote.remote-ssh \
-               redhat.vscode-yaml golang.go; do
-        code --install-extension "$ext" --force > /dev/null 2>&1
-    done
-    info "✅ Extensões padrão do VS Code instaladas"
-fi
-
-if [ "$HAS_BACKUP" = true ] && [ -d "$BACKUP_DIR/inventory/vscode-user" ]; then
-    mkdir -p ~/.config/Code/User
-    rsync -a --update "$BACKUP_DIR"/inventory/vscode-user/ ~/.config/Code/User/
-    info "✅ settings/keybindings/snippets do VS Code restaurados do backup"
-fi
-
-#==============================================================================
-# APPS DE DESKTOP (Chrome, Slack, Spotify, DBeaver, Postman, Telegram)
-#==============================================================================
-section "Instalando aplicativos de desktop"
-
-if ! command -v google-chrome &> /dev/null; then
-    install_chrome() {
-        wget -q -O /tmp/google-chrome.gpg https://dl.google.com/linux/linux_signing_key.pub
-        sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg < /tmp/google-chrome.gpg
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list > /dev/null
-        rm -f /tmp/google-chrome.gpg
-        sudo apt-get update
-        sudo apt-get install -y google-chrome-stable
-    }
-    run_step "instalar Chrome" install_chrome && info "✅ Google Chrome instalado"
-else
-    skip "Google Chrome já instalado"
-fi
-
-for snap_app in slack spotify postman telegram-desktop; do
-    if ! snap list 2>/dev/null | grep -q "^${snap_app} "; then
-        classic_flag=""
-        [ "$snap_app" = "slack" ] && classic_flag="--classic"
-        sudo snap install "$snap_app" $classic_flag > /dev/null 2>&1 && info "✅ $snap_app instalado" || warn "Falha ao instalar $snap_app"
-    else
-        skip "$snap_app já instalado"
-    fi
+TMO() { timeout "$@"; }
+
+ETAPAS=(apt docker node uv gh aws terraform kubectl cli-extra kiro claude rclone tailscale vpn apps displaylink zram playwright shell restore harness)
+RESTORE_ARG=""; AUTO_RESTORE=false; SEM_PROJ=false
+declare -A PULAR=() SO=()
+FALHAS=()
+
+uso() { sed -n '2,/^#====.*$/p' "$0" | sed -n '2,32p' | sed 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --restore) shift; RESTORE_ARG="${1:-}"; [ -n "$RESTORE_ARG" ] || { erro "--restore pede um caminho"; exit 2; } ;;
+        --auto-restore) AUTO_RESTORE=true ;;
+        --sem-harness) PULAR[harness]=1 ;;
+        --sem-displaylink) PULAR[displaylink]=1 ;;
+        --sem-projetos) SEM_PROJ=true ;;
+        --pular) shift; PULAR["${1:-}"]=1 ;;
+        --so) shift; SO["${1:-}"]=1 ;;
+        --listar) printf '%s\n' "${ETAPAS[@]}"; exit 0 ;;
+        -h|--help) uso; exit 0 ;;
+        *) erro "opcao desconhecida: $1"; uso; exit 2 ;;
+    esac
+    shift
 done
 
-if ! command -v dbeaver &> /dev/null; then
-    install_dbeaver() {
-        wget -q -O /tmp/dbeaver.gpg https://dbeaver.io/debs/dbeaver.gpg.key
-        sudo gpg --dearmor -o /usr/share/keyrings/dbeaver.gpg < /tmp/dbeaver.gpg
-        echo "deb [signed-by=/usr/share/keyrings/dbeaver.gpg] https://dbeaver.io/debs/dbeaver-ce /" | sudo tee /etc/apt/sources.list.d/dbeaver.list > /dev/null
-        rm -f /tmp/dbeaver.gpg
-        sudo apt-get update
-        sudo apt-get install -y dbeaver-ce
-    }
-    run_step "instalar DBeaver" install_dbeaver && info "✅ DBeaver instalado"
-else
-    skip "DBeaver já instalado"
-fi
+[ "$(id -u)" -ne 0 ] || { erro "rode como seu usuario (o sudo e chamado onde precisa)."; exit 1; }
+[ -r /etc/os-release ] || { erro "sem /etc/os-release"; exit 1; }
+# shellcheck disable=SC1091
+. /etc/os-release
+[ "${ID:-}" = "ubuntu" ] || { erro "script feito para Ubuntu (achei: ${ID:-?})"; exit 1; }
+CODENAME="${VERSION_CODENAME:-resolute}"
+ARCH="$(dpkg --print-architecture)"
+case "$ARCH" in amd64) ARCH_ALT=x86_64; ARCH_GO=amd64 ;; arm64) ARCH_ALT=aarch64; ARCH_GO=arm64 ;; *) erro "arquitetura nao suportada: $ARCH"; exit 1 ;; esac
+[ "${VERSION_ID%%.*}" -ge 24 ] || warn "pensado para o Ubuntu 26.04 (achei $VERSION_ID); pode funcionar, nao foi testado."
+[ "${VERSION_ID:-}" = "26.04" ] || warn "versao $VERSION_ID (alvo: 26.04)."
 
-#==============================================================================
-# FERRAMENTAS ADICIONAIS (kubectx/kubens, stern, trivy, lazygit, btop, neofetch)
-#==============================================================================
-section "Instalando ferramentas adicionais"
-
-if [ ! -f /usr/local/bin/kubectx ]; then
-    install_kubectx() {
-        sudo git clone --depth 1 https://github.com/ahmetb/kubectx /opt/kubectx 2>&1 | grep -v "already exists" || true
-        sudo ln -sf /opt/kubectx/kubectx /usr/local/bin/kubectx
-        sudo ln -sf /opt/kubectx/kubens /usr/local/bin/kubens
-    }
-    run_step "instalar kubectx/kubens" install_kubectx && info "✓ kubectx/kubens instalados"
-fi
-
-if ! command -v stern &> /dev/null; then
-    install_stern() {
-        local version; version="$(gh_latest_tag stern/stern)"
-        [ -n "$version" ] || return 1
-        wget -q "https://github.com/stern/stern/releases/download/${version}/stern_${version#v}_linux_amd64.tar.gz" -O /tmp/stern.tar.gz
-        tar -xzf /tmp/stern.tar.gz -C /tmp stern
-        sudo mv /tmp/stern /usr/local/bin/
-        rm -f /tmp/stern.tar.gz
-    }
-    run_step "instalar stern" install_stern && info "✓ stern instalado"
-fi
-
-if ! command -v trivy &> /dev/null; then
-    install_trivy() {
-        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
-        echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list > /dev/null
-        sudo apt-get update
-        sudo apt-get install -y trivy
-    }
-    run_step "instalar trivy" install_trivy && info "✓ trivy instalado"
-fi
-
-if ! command -v lazygit &> /dev/null; then
-    install_lazygit() {
-        local version; version="$(gh_latest_tag jesseduffield/lazygit | sed 's/^v//')"
-        [ -n "$version" ] || return 1
-        curl -sLo /tmp/lazygit.tar.gz "https://github.com/jesseduffield/lazygit/releases/download/v${version}/lazygit_${version}_Linux_x86_64.tar.gz"
-        tar -xf /tmp/lazygit.tar.gz -C /tmp lazygit
-        sudo install /tmp/lazygit /usr/local/bin
-        rm -f /tmp/lazygit /tmp/lazygit.tar.gz
-    }
-    run_step "instalar lazygit" install_lazygit && info "✓ lazygit instalado"
-fi
-
-if ! command -v btop &> /dev/null; then
-    sudo snap install btop > /dev/null 2>&1 && info "✓ btop instalado" || warn "Falha ao instalar btop"
-fi
-
-if ! command -v neofetch &> /dev/null; then
-    sudo apt-get install -y neofetch && info "✓ neofetch instalado"
-fi
-
-info "✅ Ferramentas adicionais instaladas"
-
-#==============================================================================
-# OUTRAS FERRAMENTAS (vistas no seu apt-manual.txt e ainda não cobertas acima)
-#==============================================================================
-section "Instalando outras ferramentas de uso comum"
-
-# Direto dos repositorios padrao do Ubuntu, sem repo extra - seguro instalar
-# em lote. Deliberadamente NAO incluidos aqui: pacotes de bootloader/kernel
-# (grub, efibootmgr, shim-signed, linux-generic-hwe-*), meta-pacotes do Ubuntu
-# (ubuntu-minimal/standard/desktop-minimal, ja vem na instalacao do sistema) e
-# IME/idioma chines (ibus-table-cangjie*, libchewing*, libpinyin*, m17n-db)
-# que sao dependencias automaticas, nao escolhas suas.
-sudo apt-get install -y \
-    ffmpeg htop nmap traceroute whois tree vlc pdfarranger \
-    remmina samba-common-bin simple-scan wireguard ubuntu-restricted-addons \
-    libreoffice 2>/dev/null \
-    && info "✅ ffmpeg, htop, nmap, traceroute, whois, tree, vlc, pdfarranger, remmina, samba, simple-scan, wireguard, libreoffice instalados" \
-    || warn "Algum pacote da lista extra falhou (verifique manualmente com apt-get install <pacote>)"
-
-# TeamViewer nao esta nos repos padrao - precisa do .deb oficial.
-if ! command -v teamviewer &> /dev/null; then
-    install_teamviewer() {
-        wget -q -O /tmp/teamviewer.deb "https://download.teamviewer.com/download/linux/teamviewer_amd64.deb"
-        sudo apt-get install -y /tmp/teamviewer.deb
-        rm -f /tmp/teamviewer.deb
-    }
-    run_step "instalar TeamViewer" install_teamviewer && info "✅ TeamViewer instalado"
-else
-    skip "TeamViewer já instalado"
-fi
-
-#==============================================================================
-# RESTAURAR DADOS (Documents, Pictures, projects, Downloads se presente)
-#==============================================================================
-section "Restaurando dados do usuário"
-
-if [ "$HAS_BACKUP" = true ] && [ -d "$BACKUP_DIR/data" ]; then
-    for dir in "$BACKUP_DIR"/data/*/; do
-        [ -d "$dir" ] || continue
-        name="$(basename "$dir")"
-        mkdir -p "$HOME/$name"
-        info "Restaurando $name ..."
-        rsync -a "$dir" "$HOME/$name/" 2>/dev/null || warn "rsync teve avisos em $name (continuando)"
-    done
-    info "✅ Dados do usuário restaurados"
-else
-    mkdir -p ~/projects
-    warn "Sem backup de dados: apenas ~/projects vazio foi criado"
-fi
-
-mkdir -p ~/.kube
-
-#==============================================================================
-# GNOME SETTINGS
-#==============================================================================
-section "Configurando GNOME"
-
-if [ "$HAS_BACKUP" = true ] && [ -f "$BACKUP_DIR/inventory/gnome-dconf.txt" ] && command -v dconf &> /dev/null; then
-    dconf load / < "$BACKUP_DIR/inventory/gnome-dconf.txt" 2>/dev/null \
-        && info "✅ Configurações GNOME restauradas do backup" \
-        || warn "Falha ao restaurar dconf, aplicando defaults"
-else
-    gsettings set org.gnome.mutter workspaces-only-on-primary false 2>/dev/null || true
-    gsettings set org.gnome.desktop.wm.preferences num-workspaces 4 2>/dev/null || true
-    info "✅ GNOME configurado com defaults"
-fi
-
-#==============================================================================
-# CRONTAB
-#==============================================================================
-if [ "$HAS_BACKUP" = true ] && [ -s "$BACKUP_DIR/inventory/crontab.txt" ]; then
-    crontab "$BACKUP_DIR/inventory/crontab.txt" && info "✅ Crontab restaurado do backup"
-fi
-
-#==============================================================================
-# VERIFICAÇÃO FINAL - confere o que realmente foi restaurado no disco
-# (nao confia so no log de execucao - torna qualquer falha silenciosa visivel)
-#==============================================================================
-section "🔍 Verificação final do restore"
-
-VERIFY_FAILED=false
-check_item() {
-    local desc="$1" path="$2"
-    if [ -e "$path" ]; then
-        echo -e "  ${GREEN}✅${NC} $desc"
-    else
-        echo -e "  ${RED}❌${NC} $desc — não encontrado em $path"
-        VERIFY_FAILED=true
-    fi
+executa_etapa() { # executa_etapa nome funcao
+    local nome="$1" fn="$2"
+    if [ ${#SO[@]} -gt 0 ] && [ -z "${SO[$nome]:-}" ]; then return 0; fi
+    if [ -n "${PULAR[$nome]:-}" ]; then skip "etapa pulada: $nome"; return 0; fi
+    secao "$nome"
+    if ! "$fn"; then warn "etapa com falha: $nome"; FALHAS+=("$nome"); fi
 }
 
-if [ "$HAS_BACKUP" = true ]; then
-    ssh_key_count=$(find ~/.ssh -maxdepth 1 -type f ! -name "*.pub" ! -name "config" ! -name "known_hosts*" ! -name "authorized_keys" 2>/dev/null | wc -l)
-    if [ "$ssh_key_count" -eq 1 ] && [ -f ~/.ssh/id_ed25519 ]; then
-        # Sinal forte de que o restore FALHOU: essa e exatamente a chave que
-        # o fallback gera quando nao acha nenhuma chave apos tentar restaurar
-        # do backup - nao e uma chave restaurada de verdade.
-        echo -e "  ${RED}❌${NC} Só existe id_ed25519 (chave NOVA gerada pelo fallback) — suas chaves reais NÃO foram restauradas"
-        VERIFY_FAILED=true
-    elif [ "$ssh_key_count" -gt 0 ]; then
-        echo -e "  ${GREEN}✅${NC} Chaves SSH privadas ($ssh_key_count encontrada(s))"
+tem() { command -v "$1" >/dev/null 2>&1; }
+pkg_instalado() { dpkg -s "$1" >/dev/null 2>&1; }
+apt_i() { sudo apt-get install -y --no-install-recommends "$@"; }
+apt_faltantes() { # imprime so os pacotes que ainda nao estao instalados e existem no repo
+    local p
+    for p in "$@"; do
+        pkg_instalado "$p" && continue
+        apt-cache show "$p" >/dev/null 2>&1 && printf '%s\n' "$p" || warn "pacote nao existe no repo: $p"
+    done
+}
+apt_garante() {
+    local falt; falt="$(apt_faltantes "$@")"
+    [ -z "$falt" ] && return 0
+    # shellcheck disable=SC2086
+    TMO 1200 sudo apt-get install -y --no-install-recommends $falt
+}
+# Repo apt de terceiro: baixa a chave e grava o .sources so se ainda nao existe.
+repo_apt() { # repo_apt nome url_chave uris suites components [arch]
+    local nome="$1" chave="$2" uris="$3" suites="$4" comps="$5" f="/etc/apt/sources.list.d/$1.sources"
+    [ -f "$f" ] && { skip "repo apt $nome"; return 0; }
+    sudo install -d -m 0755 /etc/apt/keyrings
+    local tmp ext=asc; tmp="$(mktemp)"
+    TMO 60 curl -fsSL "$chave" -o "$tmp" || { rm -f "$tmp"; return 1; }
+    head -c 12 "$tmp" | grep -q 'BEGIN PGP' || ext=gpg   # chave binaria (dearmored) pede .gpg
+    sudo install -m 0644 "$tmp" "/etc/apt/keyrings/$nome.$ext"; rm -f "$tmp"
+    printf 'Types: deb\nURIs: %s\nSuites: %s\nComponents: %s\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/%s.%s\n' \
+        "$uris" "$suites" "$comps" "$ARCH" "$nome" "$ext" | sudo tee "$f" >/dev/null
+    APT_SUJO=true
+}
+# O repo de terceiro pode ainda nao ter a suite do release novo: cai para a anterior (noble).
+suite_ou_fallback() { # suite_ou_fallback url_Release
+    if TMO 20 curl -fsI "$1" >/dev/null 2>&1; then echo "$CODENAME"; else echo noble; fi
+}
+APT_SUJO=false
+apt_update_se_sujo() { if $APT_SUJO; then TMO 600 sudo apt-get update -y && APT_SUJO=false; fi; }
+
+baixa() { TMO "${3:-300}" curl -fsSL --retry 3 -o "$2" "$1"; }
+gh_tag() { TMO 30 curl -fsSL "https://api.github.com/repos/$1/releases/latest" 2>/dev/null | grep -oP '"tag_name": *"\K[^"]+' | head -1; }
+tmpd() { mktemp -d "${TMPDIR:-/tmp}/setup.XXXXXX"; }
+
+#==============================================================================
+# 1. APT: base, atualizacao e ferramentas de uso diario
+#==============================================================================
+etapa_apt() {
+    sudo -v || return 1
+    TMO 900 sudo apt-get update -y || return 1
+    TMO 1800 sudo apt-get upgrade -y || warn "upgrade com aviso"
+    # base e build
+    apt_garante build-essential git curl wget ca-certificates gnupg unzip zip jq tmux zsh vim \
+        software-properties-common apt-transport-https lsb-release pkg-config openssl age \
+        ripgrep fd-find fzf tree htop net-tools dnsutils iproute2 rsync xclip \
+        openssh-client openssh-server gpg-agent dconf-cli \
+        python3 python3-venv python3-pip python3-dev pipx \
+        dkms "linux-headers-$(uname -r)" linux-headers-generic \
+        libfuse2t64 fuse3 \
+        network-manager network-manager-openvpn network-manager-openvpn-gnome openvpn \
+        ffmpeg libportaudio2 libsndfile1 espeak-ng pulseaudio-utils v4l-utils \
+        libnss3-tools bash-completion shellcheck remmina remmina-plugin-rdp fastfetch
+    # curl de snap/apt pode faltar zsh plugins: tratados na etapa shell
+    return 0
+}
+
+#==============================================================================
+# 2. Docker (repo oficial; cai para a suite noble se a nova ainda nao existe)
+#==============================================================================
+etapa_docker() {
+    if ! tem docker; then
+        local suite; suite="$(suite_ou_fallback "https://download.docker.com/linux/ubuntu/dists/$CODENAME/Release")"
+        repo_apt docker https://download.docker.com/linux/ubuntu/gpg https://download.docker.com/linux/ubuntu "$suite" stable || return 1
+        apt_update_se_sujo || return 1
+        TMO 1200 sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
+    else skip "docker $(docker --version 2>/dev/null | cut -d, -f1)"; fi
+    sudo systemctl enable --now docker 2>/dev/null || true
+    id -nG "$USER" | tr ' ' '\n' | grep -qx docker || { sudo usermod -aG docker "$USER" && warn "grupo docker adicionado: faca logout/login para valer."; }
+    return 0
+}
+
+#==============================================================================
+# 3. Node (nvm, para os CLIs globais) e Node do sistema via NodeSource
+#==============================================================================
+etapa_node() {
+    export NVM_DIR="$HOME/.nvm"
+    if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+        local tag; tag="$(gh_tag nvm-sh/nvm)"; tag="${tag:-v0.40.3}"
+        TMO 300 bash -c "curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/$tag/install.sh | PROFILE=/dev/null bash" || return 1
+    else skip "nvm"; fi
+    # shellcheck disable=SC1091
+    . "$NVM_DIR/nvm.sh"
+    if ! nvm ls "$NODE_MAJOR" >/dev/null 2>&1; then TMO 600 nvm install "$NODE_MAJOR" || return 1; else skip "node $NODE_MAJOR no nvm"; fi
+    nvm alias default "$NODE_MAJOR" >/dev/null 2>&1 || true
+    # Node do sistema (usado por servicos systemd que nao carregam o nvm)
+    if ! pkg_instalado nodejs; then
+        repo_apt nodesource https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key "https://deb.nodesource.com/node_${NODE_MAJOR}.x" nodistro main || return 1
+        apt_update_se_sujo || return 1
+        TMO 900 sudo apt-get install -y nodejs || return 1
+    else skip "nodejs do sistema"; fi
+    return 0
+}
+
+#==============================================================================
+# 4. uv + Python 3.12 do uv (as venvs do Jarvis nao usam o Python 3.14 do sistema)
+#==============================================================================
+etapa_uv() {
+    if ! tem uv && [ ! -x "$HOME/.local/bin/uv" ]; then
+        TMO 300 bash -c 'curl -fsSL https://astral.sh/uv/install.sh | UV_NO_MODIFY_PATH=1 sh' || return 1
+    else skip "uv"; fi
+    export PATH="$HOME/.local/bin:$PATH"
+    if ! uv python find "$PY_VERSAO" >/dev/null 2>&1; then TMO 600 uv python install "$PY_VERSAO" || return 1; else skip "python $PY_VERSAO (uv)"; fi
+    # As venvs exatas (versao e hashes fixos) sao criadas pelo install.sh do harness (voz-ambiente).
+    return 0
+}
+
+#==============================================================================
+# 5. gh, aws cli v2, terraform, kubectl e utilitarios de cluster
+#==============================================================================
+etapa_gh() {
+    if ! tem gh; then
+        repo_apt github-cli https://cli.github.com/packages/githubcli-archive-keyring.gpg https://cli.github.com/packages stable main || return 1
+        apt_update_se_sujo || return 1
+        TMO 600 sudo apt-get install -y gh || return 1
+    else skip "gh"; fi
+    return 0
+}
+
+etapa_aws() {
+    if tem aws && aws --version 2>&1 | grep -q 'aws-cli/2'; then skip "aws cli v2"; else
+        local d; d="$(tmpd)"
+        baixa "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH_ALT}.zip" "$d/aws.zip" 600 || return 1
+        unzip -q "$d/aws.zip" -d "$d" && TMO 300 sudo "$d/aws/install" --update || return 1
+        rm -rf "$d"
+    fi
+    if ! tem session-manager-plugin; then
+        local d; d="$(tmpd)"
+        local arq=ubuntu_64bit; [ "$ARCH" = arm64 ] && arq=ubuntu_arm64
+        if baixa "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/$arq/session-manager-plugin.deb" "$d/ssm.deb" 300; then
+            sudo apt-get install -y "$d/ssm.deb" || warn "session-manager-plugin nao instalou"
+        else warn "nao baixei o session-manager-plugin"; fi
+        rm -rf "$d"
+    else skip "session-manager-plugin"; fi
+    return 0
+}
+
+etapa_terraform() {
+    if ! tem terraform; then
+        local suite; suite="$(suite_ou_fallback "https://apt.releases.hashicorp.com/dists/$CODENAME/Release")"
+        repo_apt hashicorp https://apt.releases.hashicorp.com/gpg https://apt.releases.hashicorp.com "$suite" main || return 1
+        apt_update_se_sujo || return 1
+        TMO 600 sudo apt-get install -y terraform || return 1
+    else skip "terraform"; fi
+    # CLI de login do Terraform Cloud: o token vem do backup (~/.terraform.d/credentials.tfrc.json)
+    [ -f "$HOME/.terraform.d/credentials.tfrc.json" ] || warn "sem credentials.tfrc.json: rode 'terraform login' ou restaure o backup."
+    return 0
+}
+
+etapa_kubectl() {
+    local bin=/usr/local/bin
+    if ! tem kubectl; then
+        local v d; v="$(TMO 30 curl -fsSL https://dl.k8s.io/release/stable.txt)" || return 1
+        d="$(tmpd)"
+        baixa "https://dl.k8s.io/release/$v/bin/linux/$ARCH_GO/kubectl" "$d/kubectl" 300 || return 1
+        baixa "https://dl.k8s.io/release/$v/bin/linux/$ARCH_GO/kubectl.sha256" "$d/kubectl.sha256" 60 || return 1
+        ( cd "$d" && echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c - >/dev/null ) || { erro "sha256 do kubectl nao confere"; return 1; }
+        sudo install -m 0755 "$d/kubectl" "$bin/kubectl"; rm -rf "$d"
+    else skip "kubectl"; fi
+    if ! tem helm; then
+        local d; d="$(tmpd)"
+        baixa https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 "$d/get-helm" 60 && TMO 300 bash "$d/get-helm" || warn "helm nao instalou"
+        rm -rf "$d"
+    else skip "helm"; fi
+    if ! tem k9s; then
+        local tag d; tag="$(gh_tag derailed/k9s)"; d="$(tmpd)"
+        if [ -n "$tag" ] && baixa "https://github.com/derailed/k9s/releases/download/$tag/k9s_Linux_${ARCH_GO}.tar.gz" "$d/k9s.tgz" 300; then
+            tar -xzf "$d/k9s.tgz" -C "$d" k9s && sudo install -m 0755 "$d/k9s" "$bin/k9s"
+        else warn "k9s nao instalou"; fi
+        rm -rf "$d"
+    else skip "k9s"; fi
+    if ! tem argocd; then
+        local d; d="$(tmpd)"
+        baixa "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-$ARCH_GO" "$d/argocd" 300 \
+            && sudo install -m 0755 "$d/argocd" "$bin/argocd" || warn "argocd nao instalou"
+        rm -rf "$d"
+    else skip "argocd"; fi
+    return 0
+}
+
+#==============================================================================
+# 6b. CLIs extras (binarios de release do GitHub, sem repo apt)
+#==============================================================================
+instala_release() { # instala_release comando repo asset(@TAG@=tag, @VER@=tag sem v) binario
+    local cmd="$1" repo="$2" asset="$3" bin="$4" tag d url
+    tem "$cmd" && { skip "$cmd"; return 0; }
+    tag="$(gh_tag "$repo")"; [ -n "$tag" ] || { warn "sem tag de $repo (rate limit do GitHub?)"; return 1; }
+    asset="${asset//@TAG@/$tag}"; asset="${asset//@VER@/${tag#v}}"
+    url="https://github.com/$repo/releases/download/$tag/$asset"
+    d="$(tmpd)"
+    if baixa "$url" "$d/a" 300 && tar -xzf "$d/a" -C "$d" "$bin" 2>/dev/null; then
+        sudo install -m 0755 "$d/$bin" "/usr/local/bin/$bin"
+    else warn "$cmd nao instalou ($url)"; rm -rf "$d"; return 1; fi
+    rm -rf "$d"
+}
+
+etapa_cli_extra() {
+    local rc=0
+    instala_release stern stern/stern "stern_@VER@_linux_${ARCH_GO}.tar.gz" stern || rc=1
+    instala_release lazygit jesseduffield/lazygit "lazygit_@VER@_Linux_${ARCH_ALT}.tar.gz" lazygit || rc=1
+    instala_release trivy aquasecurity/trivy "trivy_@VER@_Linux-64bit.tar.gz" trivy || rc=1
+    instala_release actionlint rhysd/actionlint "actionlint_@VER@_linux_${ARCH_GO}.tar.gz" actionlint || rc=1
+    if ! tem kubectx; then
+        [ -d /opt/kubectx ] || sudo git clone -q --depth 1 https://github.com/ahmetb/kubectx /opt/kubectx || rc=1
+        sudo ln -sf /opt/kubectx/kubectx /usr/local/bin/kubectx; sudo ln -sf /opt/kubectx/kubens /usr/local/bin/kubens
+    else skip "kubectx"; fi
+    return $rc
+}
+
+#==============================================================================
+# 7b. Aplicativos de desktop: Chrome, VS Code, snaps (Slack, Spotify, Postman, btop, DBeaver)
+#     Kiro IDE: instalar a mao pelo instalador do site (nao ha repo apt estavel verificado).
+#==============================================================================
+etapa_apps() {
+    local rc=0
+    if ! tem google-chrome; then
+        repo_apt google-chrome https://dl.google.com/linux/linux_signing_key.pub http://dl.google.com/linux/chrome/deb stable main || return 1
+        apt_update_se_sujo || return 1
+        TMO 900 sudo apt-get install -y google-chrome-stable || rc=1
+    else skip "google-chrome"; fi
+    if ! tem code; then
+        repo_apt vscode https://packages.microsoft.com/keys/microsoft.asc https://packages.microsoft.com/repos/code stable main || return 1
+        apt_update_se_sujo || return 1
+        TMO 900 sudo apt-get install -y code || rc=1
+    else skip "vscode"; fi
+    local app flag
+    for app in slack spotify postman btop dbeaver-ce; do
+        snap list "$app" >/dev/null 2>&1 && { skip "snap $app"; continue; }
+        flag=""; [ "$app" = slack ] && flag="--classic"
+        # shellcheck disable=SC2086
+        TMO 900 sudo snap install "$app" $flag || { warn "snap $app falhou"; rc=1; }
+    done
+    return $rc
+}
+
+#==============================================================================
+# 6. Kiro CLI e Claude Code (instaladores oficiais, em ~/.local)
+#==============================================================================
+etapa_kiro() {
+    if tem kiro-cli || [ -x "$HOME/.local/bin/kiro-cli" ]; then skip "kiro-cli"; else
+        TMO 600 bash -c 'curl -fsSL https://cli.kiro.dev/install | bash' || return 1
+    fi
+    warn "Kiro CLI: login com 'kiro-cli login' (o backup traz o token, mas ele pode ter expirado)."
+    return 0
+}
+
+etapa_claude() {
+    if tem claude || [ -x "$HOME/.local/bin/claude" ]; then skip "claude code"; else
+        TMO 600 bash -c 'curl -fsSL https://claude.ai/install.sh | bash' || return 1
+    fi
+    return 0
+}
+
+#==============================================================================
+# 7. rclone, Tailscale, openvpn (3 e NetworkManager)
+#==============================================================================
+etapa_rclone() {
+    if tem rclone; then skip "rclone"; return 0; fi
+    apt_garante rclone || return 1
+    # O rclone do apt pode estar atrasado: se a versao nao suportar o remote do backup, use rclone selfupdate.
+    return 0
+}
+
+etapa_tailscale() {
+    if ! tem tailscale; then
+        local suite; suite="$(suite_ou_fallback "https://pkgs.tailscale.com/stable/ubuntu/$CODENAME.noarmor.gpg")"
+        repo_apt tailscale "https://pkgs.tailscale.com/stable/ubuntu/$suite.noarmor.gpg" https://pkgs.tailscale.com/stable/ubuntu "$suite" main || return 1
+        apt_update_se_sujo || return 1
+        TMO 600 sudo apt-get install -y tailscale || return 1
+    else skip "tailscale"; fi
+    sudo systemctl enable --now tailscaled 2>/dev/null || true
+    tailscale status >/dev/null 2>&1 || warn "Tailscale sem login: rode 'sudo tailscale up'."
+    return 0
+}
+
+etapa_vpn() {
+    # openvpn3 (cliente com sessoes) e os pacotes do NetworkManager ja vieram na etapa apt.
+    if ! pkg_instalado openvpn3; then
+        local suite; suite="$(suite_ou_fallback "https://packages.openvpn.net/openvpn3/debian/dists/$CODENAME/Release")"
+        repo_apt openvpn3 https://packages.openvpn.net/packages-repo.gpg https://packages.openvpn.net/openvpn3/debian "$suite" main || return 1
+        apt_update_se_sujo || return 1
+        TMO 600 sudo apt-get install -y openvpn3 || warn "openvpn3 nao instalou"
+    else skip "openvpn3"; fi
+    return 0
+}
+
+#==============================================================================
+# 8. DisplayLink (dock USB): evdi por DKMS com o conserto de 04/11
+#    O pacote muda de build mantendo o numero do kernel, o DKMS acha que o evdi
+#    ja esta instalado e nao recompila; o modulo velho e recusado (Exec format
+#    error) e o serviço entra em laco. O conserto: parar o servico, remover o evdi,
+#    recompilar para o kernel em uso, depmod, modprobe, subir o servico.
+#==============================================================================
+conserta_evdi() {
+    local k; k="$(uname -r)"
+    local src ver
+    src="$(find /usr/src -maxdepth 1 -name 'evdi-*' -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2)"
+    [ -n "$src" ] || { warn "fontes do evdi nao encontradas em /usr/src"; return 1; }
+    ver="${src#evdi-}"
+    if lsmod | grep -q '^evdi ' && systemctl is-active --quiet displaylink-driver.service 2>/dev/null; then
+        skip "evdi carregado e displaylink-driver ativo"; return 0
+    fi
+    info "recompilando evdi $ver para $k"
+    sudo systemctl stop displaylink-driver.service 2>/dev/null || true
+    sudo modprobe -r evdi 2>/dev/null || true
+    sudo dkms remove "evdi/$ver" --all >/dev/null 2>&1 || true
+    sudo find "/lib/modules/$k" -name 'evdi.ko*' -delete 2>/dev/null || true
+    TMO 900 sudo dkms install "evdi/$ver" -k "$k" || { erro "dkms install falhou (o evdi $ver pode nao suportar o kernel $k)"; return 1; }
+    sudo depmod -a "$k"
+    sudo modprobe evdi || { erro "modprobe evdi falhou"; return 1; }
+    sudo systemctl start displaylink-driver.service 2>/dev/null || true
+    systemctl is-active --quiet displaylink-driver.service && info "evdi carregado, displaylink ativo" || warn "displaylink-driver nao ficou ativo"
+    return 0
+}
+
+etapa_displaylink() {
+    if ! pkg_instalado displaylink-driver; then
+        # Repo oficial da Synaptics (DisplayLink): o pacote de chaves vem do proprio site
+        local d; d="$(tmpd)"
+        baixa https://www.synaptics.com/sites/default/files/Ubuntu/pool/stable/main/all/synaptics-repository-keyring.deb "$d/k.deb" 120 \
+            && sudo apt-get install -y "$d/k.deb" || { rm -rf "$d"; return 1; }
+        rm -rf "$d"
+        TMO 600 sudo apt-get update -y || return 1
+        TMO 1800 sudo apt-get install -y displaylink-driver || return 1
+    else skip "displaylink-driver"; fi
+    # Secure Boot ligado exige assinar o modulo (MOK). Aviso so, nao da para automatizar sem reboot.
+    if tem mokutil && mokutil --sb-state 2>/dev/null | grep -qi 'enabled'; then
+        warn "Secure Boot ligado: o DKMS vai pedir para cadastrar a chave MOK no proximo boot (tela azul)."
+    fi
+    conserta_evdi
+}
+
+#==============================================================================
+# 9. zram (8 GB: zram0 4 GB lzo-rle + zram1 4 GB zstd) e swap em disco
+#==============================================================================
+etapa_zram() {
+    apt_garante systemd-zram-generator || return 1
+    local conf=/etc/systemd/zram-generator.conf novo
+    novo="$(printf '[zram0]\nzram-size = %s\ncompression-algorithm = %s\nswap-priority = 100\n\n[zram1]\nzram-size = %s\ncompression-algorithm = %s\nswap-priority = 100\n' \
+        "$ZRAM_MB_0" "$ZRAM_ALGO_0" "$ZRAM_MB_1" "$ZRAM_ALGO_1")"
+    if [ -f "$conf" ] && [ "$(sudo cat "$conf")" = "$novo" ]; then skip "zram-generator.conf"; else
+        printf '%s\n' "$novo" | sudo tee "$conf" >/dev/null
+        sudo systemctl daemon-reload
+    fi
+    local u
+    for u in systemd-zram-setup@zram0.service systemd-zram-setup@zram1.service; do
+        systemctl is-active --quiet "$u" 2>/dev/null || sudo systemctl start "$u" 2>/dev/null || warn "nao subiu $u (confira no proximo boot)"
+    done
+    # swap em disco: o instalador do Ubuntu cria /swap.img; so ajusta se o tamanho divergir.
+    if [ -f /swap.img ]; then
+        local atual alvo; atual="$(sudo stat -c %s /swap.img)"; alvo=$((SWAP_FILE_GB * 1073741824))
+        if [ "$atual" -ne "$alvo" ]; then
+            info "ajustando /swap.img para ${SWAP_FILE_GB}G"
+            sudo swapoff /swap.img 2>/dev/null || true
+            sudo rm -f /swap.img && sudo fallocate -l "${SWAP_FILE_GB}G" /swap.img && sudo chmod 600 /swap.img \
+                && sudo mkswap /swap.img >/dev/null && sudo swapon /swap.img || return 1
+        else skip "/swap.img ${SWAP_FILE_GB}G"; fi
     else
-        echo -e "  ${RED}❌${NC} Nenhuma chave SSH privada restaurada em ~/.ssh"
-        VERIFY_FAILED=true
+        info "criando /swap.img de ${SWAP_FILE_GB}G"
+        sudo fallocate -l "${SWAP_FILE_GB}G" /swap.img && sudo chmod 600 /swap.img && sudo mkswap /swap.img >/dev/null \
+            && sudo swapon /swap.img || return 1
     fi
-    check_item "AWS config (~/.aws/config)"          ~/.aws/config
-    check_item "AWS credentials (~/.aws/credentials)" ~/.aws/credentials
-    check_item "kubeconfig (~/.kube/config)"          ~/.kube/config
-    check_item "Docker config (~/.docker/config.json)" ~/.docker/config.json
-    check_item "Segredos do zsh (~/.zsh_secrets)"     ~/.zsh_secrets
-    check_item "Histórico do zsh (~/.zsh_history)"    ~/.zsh_history
-    check_item "Conexões do DBeaver"                  ~/.local/share/DBeaverData
-    check_item "Config do Claude Code (~/.claude.json)" ~/.claude.json
-    check_item "Histórico de conversas do Claude Code" ~/.claude/projects
-    if command -v openvpn3 >/dev/null 2>&1 && [ -f "$BACKUP_DIR/secrets.tar.gpg" ]; then
-        if openvpn3 configs-list 2>/dev/null | tail -n +3 | grep -v '^-*$' | grep -q .; then
-            echo -e "  ${GREEN}✅${NC} Perfil(is) VPN importado(s) no openvpn3"
-        else
-            echo -e "  ${YELLOW}⚠${NC}  Nenhum perfil VPN encontrado no openvpn3 (pode ser que você não tinha nenhum)"
-        fi
+    grep -qE '^/swap\.img[[:space:]]' /etc/fstab || echo '/swap.img none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+    return 0
+}
+
+#==============================================================================
+# 10. Playwright e as libs do WebKit (faltam no 26.04)
+#==============================================================================
+etapa_playwright() {
+    export NVM_DIR="$HOME/.nvm"
+    # shellcheck disable=SC1091
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+    tem npx || { warn "npx ausente (etapa node)"; return 1; }
+    TMO 900 npx --yes playwright-core install-deps webkit chromium || return 1
+    return 0
+}
+
+#==============================================================================
+# 11. Shell: oh-my-zsh + plugins, zsh como padrao, fzf, git
+#==============================================================================
+etapa_shell() {
+    [ -d "$HOME/.oh-my-zsh" ] || TMO 300 sh -c 'RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"' || warn "oh-my-zsh nao instalou"
+    local zc="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}" p
+    for p in zsh-users/zsh-syntax-highlighting zsh-users/zsh-autosuggestions; do
+        local n="${p#*/}"
+        [ -d "$zc/plugins/$n" ] && skip "plugin $n" || TMO 120 git clone --depth 1 "https://github.com/$p" "$zc/plugins/$n" || warn "plugin $n nao clonou"
+    done
+    [ "$(getent passwd "$USER" | cut -d: -f7)" = "$(command -v zsh)" ] || { sudo chsh -s "$(command -v zsh)" "$USER" && info "shell padrao: zsh (vale no proximo login)"; }
+    [ -f "$HOME/.fzf.zsh" ] || true
+    # git: identidade vem do ~/.gitconfig do backup; sem backup, usa as variaveis opcionais
+    if [ -z "$(git config --global user.name 2>/dev/null)" ] && [ -n "${GIT_USER_NAME:-}" ]; then git config --global user.name "$GIT_USER_NAME"; fi
+    if [ -z "$(git config --global user.email 2>/dev/null)" ] && [ -n "${GIT_USER_EMAIL:-}" ]; then git config --global user.email "$GIT_USER_EMAIL"; fi
+    [ -n "$(git config --global user.email 2>/dev/null)" ] || warn "git sem identidade: restaure o backup ou rode git config --global user.name/user.email."
+    git config --global init.defaultBranch >/dev/null 2>&1 || git config --global init.defaultBranch main
+    return 0
+}
+
+#==============================================================================
+# 12. RESTORE do backup cifrado
+#==============================================================================
+acha_backup() {
+    local alvo="$1"
+    if $AUTO_RESTORE && [ -z "$alvo" ]; then
+        alvo="$(ls -dt /media/"$USER"/*/backup-ubuntu-*/ /run/media/"$USER"/*/backup-ubuntu-*/ 2>/dev/null | head -1)"
+        [ -n "$alvo" ] || { erro "nao achei backup-ubuntu-* em /media/$USER/*"; return 1; }
+        info "backup encontrado: $alvo"
     fi
-    check_item "Certificados de VPN NetworkManager (~/.cert/nm-openvpn)" ~/.cert/nm-openvpn
-    if command -v nmcli >/dev/null 2>&1; then
-        if nmcli -t -f TYPE connection show 2>/dev/null | grep -q '^vpn$'; then
-            echo -e "  ${GREEN}✅${NC} Conexão(ões) VPN do NetworkManager importada(s)"
-        else
-            echo -e "  ${YELLOW}⚠${NC}  Nenhuma conexão VPN do NetworkManager encontrada (pode ser que você não tinha nenhuma)"
-        fi
+    [ -n "$alvo" ] || return 1
+    if [ -d "$alvo" ]; then alvo="${alvo%/}/backup.tar.gpg"; fi
+    [ -f "$alvo" ] || { erro "nao achei $alvo"; return 1; }
+    printf '%s' "$alvo"
+}
+
+restaura_projetos() {
+    local tsv="$1" n=0 rel url
+    [ -s "$tsv" ] || return 0
+    export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+    while IFS=$'\t' read -r rel url; do
+        [ -n "$rel" ] || continue
+        [ -d "$HOME/$rel/.git" ] && continue
+        mkdir -p "$(dirname "$HOME/$rel")"
+        TMO 300 git clone -q "$url" "$HOME/$rel" 2>/dev/null && n=$((n+1)) || warn "nao clonei ~/$rel"
+    done < "$tsv"
+    info "$n repositorios clonados"
+}
+
+etapa_restore() {
+    local arq
+    if [ -z "$RESTORE_ARG" ] && ! $AUTO_RESTORE; then
+        warn "sem --restore: nada restaurado (SSH, AWS, VPN, harness e dados ficam por fazer)."
+        return 0
+    fi
+    arq="$(acha_backup "$RESTORE_ARG")" || return 1
+    local dir; dir="$(dirname "$arq")"
+    if [ -f "$dir/SHA256SUMS" ]; then
+        info "conferindo sha256 do backup..."
+        ( cd "$dir" && sha256sum -c SHA256SUMS >/dev/null ) || { erro "sha256 NAO confere: backup corrompido ou adulterado. Abortando o restore."; return 1; }
+    else warn "sem SHA256SUMS ao lado do backup; so a integridade interna do gpg sera conferida."; fi
+    [ -t 0 ] || { erro "preciso de um terminal para pedir a senha."; return 1; }
+    local PASS; read -rs -p "Senha do backup: " PASS; echo
+    info "extraindo para $HOME (arquivos que ja existem NAO sao sobrescritos)..."
+    local rc
+    set +e
+    gpg --batch --pinentry-mode loopback --passphrase-fd 3 -d "$arq" 3< <(printf '%s' "$PASS") 2>/dev/null \
+        | tar -x --skip-old-files --no-same-owner -C "$HOME"
+    rc=("${PIPESTATUS[@]}")
+    PASS=""
+    if [ "${rc[0]}" -ne 0 ] || [ "${rc[1]}" -ne 0 ]; then erro "falha ao decifrar/extrair (senha errada? gpg=${rc[0]} tar=${rc[1]})"; return 1; fi
+    local meta="$HOME/$META"
+    [ -d "$meta" ] || { erro "backup sem $META: nao foi gerado pelo backup.sh"; return 1; }
+
+    # Itens que eram symlink na origem (~/.zsh_secrets etc.) entram como arquivo real se ainda nao existem
+    if [ -d "$meta/deref" ]; then
+        ( cd "$meta/deref" && find . -type f -o -type l | sed 's#^\./##' ) | while IFS= read -r f; do
+            [ -e "$HOME/$f" ] || [ -L "$HOME/$f" ] || { mkdir -p "$(dirname "$HOME/$f")"; cp -a "$meta/deref/$f" "$HOME/$f"; }
+        done
     fi
 
-    if [ "$VERIFY_FAILED" = true ]; then
-        echo ""
-        error "############################################################"
-        error "# Um ou mais itens acima NÃO foram restaurados."
-        error "# Provável causa: senha errada (ou pulada) na etapa de"
-        error "# 'Restaurando segredos e credenciais', lá em cima neste log."
-        error "# RECUPERAÇÃO MANUAL (roda de novo, só isso, sem repetir o"
-        error "# resto do script):"
-        error "#"
-        error "#   mkdir -p /tmp/restore-secrets"
-        error "#   gpg -d $BACKUP_DIR/secrets.tar.gpg | tar -x -C /tmp/restore-secrets"
-        error "#   rsync -a --update /tmp/restore-secrets/aws/ ~/.aws/"
-        error "#   rsync -a --update /tmp/restore-secrets/ssh/  ~/.ssh/"
-        error "#   # (repita para kube/config, docker/config.json, gnupg,"
-        error "#   #  terraform.d, zsh_secrets, dbeaver, claude, history"
-        error "#   #  conforme o que faltar acima)"
-        error "#   rm -rf /tmp/restore-secrets"
-        error "############################################################"
-    else
-        info "✅ Todos os itens de segredos/dados críticos foram restaurados com sucesso"
+    # Permissoes
+    [ -d "$HOME/.ssh" ] && { chmod 700 "$HOME/.ssh"; find "$HOME/.ssh" -type f \( -name 'id_*' -o -name '*.pem' -o -name '*_key' \) ! -name '*.pub' -exec chmod 600 {} +; }
+    [ -d "$HOME/.gnupg" ] && chmod 700 "$HOME/.gnupg"
+    [ -d "$HOME/.aws" ] && chmod 700 "$HOME/.aws"
+    [ -d "$HOME/.kube" ] && chmod 700 "$HOME/.kube"
+    [ -f "$HOME/.zsh_secrets" ] && chmod 600 "$HOME/.zsh_secrets"
+    [ -f "$HOME/.terraform.d/credentials.tfrc.json" ] && chmod 600 "$HOME/.terraform.d/credentials.tfrc.json"
+    [ -d "$HOME/.cert" ] && find "$HOME/.cert" -type f -exec chmod 600 {} +
+
+    # Perfis de VPN do NetworkManager (reescreve o HOME de origem, se o usuario mudou)
+    local raiz="$meta/raiz" origem; origem="$(cat "$meta/inventario/home-origem.txt" 2>/dev/null || true)"
+    if [ -d "$raiz/etc/NetworkManager/system-connections" ]; then
+        local f
+        for f in "$raiz/etc/NetworkManager/system-connections"/*; do
+            [ -f "$f" ] || continue
+            local dst; dst="/etc/NetworkManager/system-connections/$(basename "$f")"
+            [ -f "$dst" ] && { skip "VPN $(basename "$f")"; continue; }
+            if [ -n "$origem" ] && [ "$origem" != "$HOME" ]; then sed "s#$origem#$HOME#g" "$f" | sudo tee "$dst" >/dev/null; else sudo cp "$f" "$dst"; fi
+            sudo chown root:root "$dst"; sudo chmod 600 "$dst"
+        done
+        sudo nmcli connection reload 2>/dev/null || true
     fi
+    # /etc que mudou (zram e DKMS sao tratados nas proprias etapas; o resto vem so se ainda nao existe)
+    if [ -d "$raiz/etc" ]; then
+        local f rel
+        while IFS= read -r f; do
+            rel="${f#"$raiz"}"
+            case "$rel" in /etc/NetworkManager/system-connections/*|/etc/systemd/zram-generator.conf*|/etc/hosts) continue ;; esac
+            [ -e "$rel" ] && continue
+            sudo mkdir -p "$(dirname "$rel")" && sudo cp -a "$f" "$rel"
+        done < <(find "$raiz/etc" -type f)
+        info "hosts de origem em $raiz/etc/hosts (nao aplicado automaticamente; confira)."
+        mkdir -p "$HOME/.local/share/backup-ubuntu-restore" && cp -a "$raiz/etc/hosts" "$HOME/.local/share/backup-ubuntu-restore/hosts.origem" 2>/dev/null || true
+    fi
+    # Lista de pacotes de origem: guardada para consulta, nao reinstalada as cegas
+    mkdir -p "$HOME/.local/share/backup-ubuntu-restore"
+    cp -a "$meta/inventario" "$HOME/.local/share/backup-ubuntu-restore/" 2>/dev/null || true
+    [ -f "$meta/MANIFESTO.txt" ] && cp -a "$meta/MANIFESTO.txt" "$HOME/.local/share/backup-ubuntu-restore/" || true
+
+    # sha256 por arquivo (config e segredos)
+    if [ -f "$meta/SHA256-ARQUIVOS.txt" ]; then
+        local ruins; ruins="$( cd "$HOME" && sha256sum -c "$meta/SHA256-ARQUIVOS.txt" 2>/dev/null | grep -vc ': OK$' || true )"
+        info "sha256 por arquivo: $ruins divergentes (arquivos que ja existiam antes do restore divergem de proposito)."
+    fi
+
+    # Repos de ~/projects que nao estavam no tar
+    $SEM_PROJ || restaura_projetos "$meta/projetos-clonar.tsv"
+
+    # Limpa a pasta de meta (os inventarios ficaram em ~/.local/share/backup-ubuntu-restore)
+    rm -rf "$meta"
+    info "restore concluido."
+    return 0
+}
+
+#==============================================================================
+# 13. Harness: clonar dotfiles-claude, install.sh, servicos e linger
+#==============================================================================
+etapa_harness() {
+    export PATH="$HOME/.local/bin:$PATH"
+    if [ ! -d "$HARNESS_DIR/.git" ]; then
+        tem gh && gh auth status >/dev/null 2>&1 || ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | grep -qi 'successfully authenticated' \
+            || { erro "sem acesso ao GitHub (chave SSH ou gh auth). Restaure o backup (--restore) ou rode 'gh auth login' e repita com --so harness."; return 1; }
+        mkdir -p "$(dirname "$HARNESS_DIR")"
+        GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" TMO 600 git clone "$HARNESS_REPO" "$HARNESS_DIR" || return 1
+    else
+        skip "harness ja clonado em $HARNESS_DIR"
+        TMO 120 git -C "$HARNESS_DIR" pull --ff-only 2>/dev/null || warn "git pull do harness nao avancou (mudanca local ou sem rede); sigo com o que ha."
+    fi
+    # linger: os servicos do usuario (claude-remote, jarvis) sobem no boot sem login grafico
+    loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes' || sudo loginctl enable-linger "$USER"
+    # O install.sh linka config, binarios, units systemd --user, venvs da voz (uv, python 3.12 fixo) e liga os timers essenciais
+    ( cd "$HARNESS_DIR" && TMO 1800 ./install.sh ) || { erro "install.sh do harness falhou"; return 1; }
+    systemctl --user daemon-reload 2>/dev/null || true
+    local u
+    for u in claude-remote.service jarvis.service escritorio-local.service; do
+        [ -e "$HOME/.config/systemd/user/$u" ] || { warn "unit $u nao foi linkada pelo install.sh"; continue; }
+        systemctl --user is-enabled --quiet "$u" 2>/dev/null || systemctl --user enable "$u" 2>/dev/null || warn "nao habilitei $u"
+    done
+    # jarvis e escritorio-local sobem agora; o claude-remote so no proximo boot (subir agora abriria uma segunda sessao do Head)
+    for u in jarvis.service escritorio-local.service; do
+        [ -e "$HOME/.config/systemd/user/$u" ] && { systemctl --user is-active --quiet "$u" || systemctl --user start "$u" 2>/dev/null || warn "$u nao subiu (veja journalctl --user -u $u)"; }
+    done
+    warn "Logins que o backup nao resolve: 'gh auth login' (se o token expirou), 'aws sso login', 'kiro-cli login', 'claude' (login), 'sudo tailscale up'."
+    return 0
+}
+
+#==============================================================================
+# Ordem de execucao
+#==============================================================================
+echo "Ubuntu $VERSION_ID ($CODENAME, $ARCH). Idempotente: pode rodar de novo."
+if [ ${#SO[@]} -eq 0 ] && [ -z "$RESTORE_ARG" ] && ! $AUTO_RESTORE; then
+    warn "Sem --restore, o setup instala so as ferramentas (SSH, AWS, VPN e harness dependem do backup)."
 fi
+sudo -v || { erro "preciso do sudo"; exit 1; }
 
-#==============================================================================
-# CLEANUP
-#==============================================================================
-section "Limpando arquivos temporários"
+executa_etapa apt etapa_apt
+executa_etapa docker etapa_docker
+executa_etapa node etapa_node
+executa_etapa uv etapa_uv
+executa_etapa gh etapa_gh
+executa_etapa aws etapa_aws
+executa_etapa terraform etapa_terraform
+executa_etapa kubectl etapa_kubectl
+executa_etapa cli-extra etapa_cli_extra
+executa_etapa kiro etapa_kiro
+executa_etapa claude etapa_claude
+executa_etapa rclone etapa_rclone
+executa_etapa tailscale etapa_tailscale
+executa_etapa vpn etapa_vpn
+executa_etapa apps etapa_apps
+executa_etapa displaylink etapa_displaylink
+executa_etapa zram etapa_zram
+executa_etapa playwright etapa_playwright
+executa_etapa shell etapa_shell
+executa_etapa restore etapa_restore
+executa_etapa harness etapa_harness
 
-sudo apt-get autoremove -y
-sudo apt-get clean
-
-info "✅ Limpeza concluída"
-
-#==============================================================================
-# FINALIZAÇÃO
-#==============================================================================
-section "🎉 Setup Completo!"
-
-echo ""
-echo "=============================================="
-echo "✅ INSTALAÇÃO CONCLUÍDA COM SUCESSO!"
-echo "=============================================="
-echo ""
-echo "📦 Ferramentas instaladas:"
-echo "  ✓ Git, SSH keys, ZSH + Oh-My-Zsh + plugins"
-echo "  ✓ Miniconda + ambientes conda (restaurados ou genérico)"
-echo "  ✓ Node.js (via NVM) + pacotes npm globais"
-echo "  ✓ Docker + Docker Compose (plugin)"
-echo "  ✓ AWS CLI v2 + Session Manager"
-echo "  ✓ Terraform, kubectl, Helm, k9s, ArgoCD CLI"
-echo "  ✓ GitHub CLI, Claude Code, OpenVPN3 (+ perfil restaurado), NetworkManager VPN (+ certificados/conexão restaurados), FreeRDP3"
-echo "  ✓ VS Code + extensões + settings"
-echo "  ✓ Chrome, Slack, Spotify, DBeaver (+ conexões restauradas), Postman, Telegram, TeamViewer"
-echo "  ✓ kubectx, kubens, stern, trivy, lazygit, btop, neofetch"
-echo "  ✓ ffmpeg, htop, nmap, vlc, remmina, LibreOffice, wireguard e outras ferramentas do seu apt-manual.txt"
-echo ""
-if [ "$HAS_BACKUP" = true ]; then
-echo "📁 Dados restaurados do backup: $BACKUP_DIR"
+echo
+if [ ${#FALHAS[@]} -eq 0 ]; then
+    info "Setup concluido sem falhas. Faca logout/login (grupo docker, shell zsh) e reinicie para o claude-remote subir no boot."
 else
-echo "⚠️  Nenhum backup foi usado - dados e credenciais são novos/vazios."
+    warn "Setup concluido com falhas em: ${FALHAS[*]}. Rode de novo (so refaz o que falta) ou use --so <etapa>."
+    exit 1
 fi
-echo ""
-echo "🔑 Chaves SSH disponíveis:"
-ls ~/.ssh/*.pub 2>/dev/null || echo "  (nenhuma)"
-echo ""
-echo "💡 Próximos passos manuais (não dá pra automatizar com segurança):"
-echo "  1. Se a chave SSH é nova, adicione-a no GitHub/GitLab."
-echo "  2. Se usa 'gh auth login' pela primeira vez (sem backup de ~/.config/gh), rode e autentique com seu usuário/token."
-echo "  3. 'aws sso login --profile <perfil>' para renovar sessões SSO (tokens SSO expiram em horas, sempre exigem"
-echo "     aprovação no navegador - isso é proposital, não dá pra pular)."
-echo "  4. 'vpnup' (openvpn3) e a VPN do NetworkManager (Configurações > Rede > VPN) vão pedir usuário/senha na"
-echo "     primeira conexão - nenhuma das duas guarda senha (nem a original guardava), então não tem como automatizar."
-echo "  5. Login manual em apps com conta própria: Chrome, Slack, Spotify, Telegram, Postman (não são arquivo, são OAuth/conta)."
-echo "  6. Imagens/containers/volumes do Docker da máquina antiga NÃO foram copiados (ficam só na origem)."
-echo "  7. Reinicie a sessão (logout/login ou 'sudo reboot') para: grupo docker, shell padrão zsh."
-echo ""
-echo "=============================================="
-echo "Desenvolvido por Yuri Mussi - Julho 2026"
-echo "=============================================="
-echo ""
-echo "⚠️  É ALTAMENTE RECOMENDADO REINICIAR O SISTEMA!"
-echo "  sudo reboot"
-echo ""

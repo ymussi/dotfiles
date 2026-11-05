@@ -1,435 +1,490 @@
 #!/usr/bin/env bash
 #==============================================================================
-# backup.sh - Backup completo do ambiente Ubuntu (configs + segredos + dados)
-#
-# Gera um diretorio autocontido que o ubuntu-setup-automated.sh consegue
-# consumir para reconstruir o ambiente em outra maquina Ubuntu.
+# backup.sh - backup completo e CIFRADO desta maquina Ubuntu para um disco
+# externo (ou qualquer pasta fora do repo).
 #
 # Uso:
-#   ./backup.sh [destino] [--with-downloads[=LIMITE_MB]]
+#   ./backup.sh DESTINO [--dry-run] [--projeto-max-mb N] [--rapido]
 #
-#   destino               Diretorio onde o backup sera criado.
-#                         Default: $HOME/ubuntu-backup
-#   --with-downloads      Inclui ~/Downloads (por padrao NAO e incluido:
-#                         normalmente e a maior parte de lixo/instaladores/
-#                         Google Takeout, nao configuracao de ambiente).
-#                         Aceita limite opcional de tamanho por arquivo em MB
-#                         (default 500) para nao copiar arquivos gigantes.
+#   DESTINO            pasta onde o backup sera criado (ex.: o disco externo
+#                      montado em /media/$USER/<disco>). Nunca um repo git.
+#   --dry-run          so lista o que entraria (MANIFESTO na tela). Nao pede
+#                      senha, nao usa sudo para copiar, nao grava nada.
+#   --projeto-max-mb N pasta de ~/projects fora do git so entra se tiver ate N
+#                      MB (padrao 500).
+#   --sem-sudo         nao le /etc nem as VPNs do NetworkManager (sem pedir sudo).
+#   --rapido           pula o sha256 por arquivo do grupo "config e segredos"
+#                      (o sha256 do arquivo cifrado inteiro sempre e feito).
 #
-# O backup fica dentro de <destino>/<hostname>-<data>/ e contem:
-#   dotfiles/     arquivos de configuracao de shell/git (texto puro, sem segredo)
-#   secrets.tar.gpg  tar criptografado (AES256, senha) com ssh/aws/kube/docker/
-#                    gnupg/terraform.d/.zsh_secrets/VPNs (openvpn3 e NetworkManager)
-#   inventory/    listas de pacotes/extensoes/envs conda/versao node/dconf/crontab
-#   data/         Documents, Pictures, projects (e Downloads se pedido)
-#   MANIFEST.md   resumo humano do que foi incluido/excluido
+# Saida em DESTINO/backup-ubuntu-<host>-<data>/:
+#   backup.tar.gpg   tar cifrado (gpg simetrico AES256). A senha e pedida na
+#                    hora, duas vezes, e nunca e gravada em arquivo, argv ou log.
+#   SHA256SUMS       sha256 do backup.tar.gpg (sha256sum -c SHA256SUMS)
+#   MANIFESTO.txt    o que foi salvo (sem conteudo, so nomes/contagens/tamanhos)
 #
-# Esta etapa pode pedir sua senha de sudo (uma vez) se voce tiver VPNs
-# configuradas em Configuracoes > Rede > VPN (NetworkManager) - precisa de
-# privilegio para exportar os metadados dessas conexoes.
+# Dentro do tar, a pasta .backup-ubuntu-meta/ traz inventarios (pacotes,
+# crontab, units, dconf), copias dos arquivos de /etc que mudaram, perfis de VPN
+# do NetworkManager e o sha256 por arquivo. O ubuntu-setup-automated.sh --restore
+# le tudo isso.
+#
+# Extras: liste caminhos (relativos ao HOME) em ~/.config/backup-ubuntu-extras.txt, ou
+# aponte BACKUP_EXTRAS_FILE para outro arquivo. Assim nada especifico da sua conta fica no repo.
+#
+# NAO entram: ~/Downloads (decisao do dono), caches, node_modules, venvs,
+# ~/.aws/sso/cache, plugin-cache do terraform. Repos de ~/projects so entram se
+# tiverem mudanca nao enviada, ou nao estiverem no GitHub; os demais voltam por
+# git clone no restore.
 #==============================================================================
 set -euo pipefail
+umask 077
 
-# ---------------------------------------------------------------------------
-# Argumentos
-# ---------------------------------------------------------------------------
-DEST_BASE="${1:-$HOME/ubuntu-backup}"
-WITH_DOWNLOADS=false
-DOWNLOADS_LIMIT_MB=500
+VERSAO_SCRIPT="2026-11"
+DRY_RUN=false
+RAPIDO=false
+SEM_SUDO=false
+PROJ_MAX_MB=500
+DESTINO=""
 
-for arg in "$@"; do
-    case "$arg" in
-        --with-downloads)
-            WITH_DOWNLOADS=true
-            ;;
-        --with-downloads=*)
-            WITH_DOWNLOADS=true
-            DOWNLOADS_LIMIT_MB="${arg#*=}"
-            ;;
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+info()  { echo -e "${GREEN}[INFO]${NC} $*" >&2; }
+warn()  { echo -e "${YELLOW}[AVISO]${NC} $*" >&2; }
+erro()  { echo -e "${RED}[ERRO]${NC} $*" >&2; }
+die()   { erro "$*"; exit 1; }
+
+uso() { sed -n '2,/^#====.*$/p' "$0" | sed -n '2,38p' | sed 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY_RUN=true ;;
+        --rapido) RAPIDO=true ;;
+        --sem-sudo) SEM_SUDO=true ;;
+        --projeto-max-mb) shift; PROJ_MAX_MB="${1:-}"; [[ "$PROJ_MAX_MB" =~ ^[0-9]+$ ]] || die "--projeto-max-mb pede um numero" ;;
+        -h|--help) uso; exit 0 ;;
+        -*) die "opcao desconhecida: $1 (use --help)" ;;
+        *) [ -z "$DESTINO" ] || die "so um DESTINO"; DESTINO="$1" ;;
     esac
+    shift
+done
+[ -n "$DESTINO" ] || { uso; die "informe o DESTINO (ex.: /media/\$USER/<disco>)"; }
+[ "$(id -u)" -ne 0 ] || die "rode como o seu usuario, nao como root (o sudo e chamado so onde precisa)"
+[ -d "$DESTINO" ] || die "DESTINO nao existe ou nao esta montado: $DESTINO"
+DESTINO="$(cd "$DESTINO" && pwd -P)"
+[ -w "$DESTINO" ] || die "sem permissao de escrita em $DESTINO"
+
+# O backup leva segredos: nunca dentro de um repo git nem dentro do HOME.
+if git -C "$DESTINO" rev-parse --git-dir >/dev/null 2>&1; then
+    die "DESTINO esta dentro de um repositorio git ($DESTINO). O backup leva segredos e nao pode ir para um repo."
+fi
+case "$DESTINO/" in
+    "$HOME"/*) die "DESTINO esta dentro do seu HOME. Use o disco externo." ;;
+esac
+
+for c in tar gpg sha256sum find du git; do
+    command -v "$c" >/dev/null 2>&1 || die "falta o comando: $c"
 done
 
+HOST="$(hostname -s 2>/dev/null || hostname)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-HOSTNAME_SAFE="$(hostname -s 2>/dev/null || hostname)"
-BACKUP_DIR="${DEST_BASE%/}/${HOSTNAME_SAFE}-${STAMP}"
+NOME="backup-ubuntu-${HOST}-${STAMP}"
+SAIDA="$DESTINO/$NOME"
+META=".backup-ubuntu-meta"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERRO]${NC} $1"; }
-section() { echo ""; echo "=============================================="; echo "$1"; echo "=============================================="; }
+# Area de trabalho em tmpfs (RAM, 0700): os segredos copiados com sudo nao tocam o disco.
+RUNBASE="${XDG_RUNTIME_DIR:-/dev/shm}"
+WORK="$(mktemp -d "$RUNBASE/backup-ubuntu.XXXXXX")"
+STAGE="$WORK/stage"
+mkdir -p "$STAGE/$META"
+LISTA="$WORK/lista.nul"
+LISTA_SHA="$WORK/lista-sha.nul"
+: > "$LISTA"
+: > "$LISTA_SHA"
+MAN="$WORK/manifesto.txt"
+: > "$MAN"
+PASS=""
+cleanup() { PASS=""; rm -rf "$WORK"; }
+trap cleanup EXIT
+trap 'erro "falhou na linha $LINENO"' ERR
 
-# Com "set -e", qualquer comando nao protegido que falhar mata o script sem
-# aviso claro (so o traceback cru do bash). Este trap garante uma mensagem
-# final inequivoca sempre que isso acontecer, apontando a linha exata.
-trap 'echo ""; echo "❌❌❌ BACKUP INTERROMPIDO na linha $LINENO. A pasta pode estar incompleta:"; echo "    ${BACKUP_DIR:-<ainda nao definida>}"; echo ""' ERR
-
-# Necessario para o prompt de senha do gpg funcionar de forma confiavel
-# quando chamado de dentro de um script.
-export GPG_TTY="$(tty 2>/dev/null || true)"
-
-mkdir -p "$BACKUP_DIR"/{dotfiles,inventory/conda,data}
-info "Backup sera criado em: $BACKUP_DIR"
-
-MANIFEST="$BACKUP_DIR/MANIFEST.md"
-{
-    echo "# Backup Ubuntu - $HOSTNAME_SAFE"
-    echo ""
-    echo "- Data: $(date -Iseconds)"
-    echo "- Usuario: $(whoami)"
-    echo "- Ubuntu: $(. /etc/os-release; echo "$PRETTY_NAME")"
-    echo "- Kernel: $(uname -r)"
-    echo "- Arquitetura: $(uname -m)"
-    echo ""
-} > "$MANIFEST"
-
-#==============================================================================
-# 1. DOTFILES (texto puro, sem segredo)
-#==============================================================================
-section "Copiando dotfiles"
-
-DOTFILES=(.zshrc .zshrc.local .bashrc .bash_profile .bash_aliases .profile .gitconfig .condarc .npmrc .vimrc .fzf.zsh .fzf.bash)
-for f in "${DOTFILES[@]}"; do
-    if [ -f "$HOME/$f" ]; then
-        cp -p "$HOME/$f" "$BACKUP_DIR/dotfiles/$f"
-        info "✓ $f"
-    fi
+#------------------------------------------------------------------------------
+# Excludes (padroes do tar; valem em qualquer profundidade)
+#------------------------------------------------------------------------------
+EXCL=(
+    '.aws/sso/cache' '.aws/cli/cache'
+    '.terraform.d/plugin-cache'
+    '.kiro/crew-venv' '.kiro/.crew-venv-*' '.kiro/crew-python' '.kiro/extensions' '.kiro/logs'
+    '.claude/cache' '.claude/shell-snapshots' '.claude/statsig' '.claude/telemetry'
+    '.local/share/jarvis/venv' '.local/share/jarvis/venv.bak*'
+    'node_modules' '__pycache__' '.venv' '.terraform' '.pytest_cache' '.mypy_cache' '.nx'
+    '*.pyc'
+)
+TAR_EXCL=(); DU_EXCL=()
+for p in "${EXCL[@]}"; do
+    TAR_EXCL+=("--exclude=$p")
+    case "$p" in '*'*) DU_EXCL+=("--exclude=$p") ;; *) DU_EXCL+=("--exclude=*/$p") ;; esac
 done
 
-if [ -f "$HOME/.ssh/config" ]; then
-    cp -p "$HOME/.ssh/config" "$BACKUP_DIR/dotfiles/ssh_config"
-    info "✓ .ssh/config"
-fi
-
-echo "## Dotfiles incluidos" >> "$MANIFEST"
-# -A (nao so "ls" puro): todo arquivo aqui comeca com "." e "ls" sem -a/-A
-# nao lista ocultos por padrao - sem isso a secao saia sempre vazia no manifesto.
-ls -A "$BACKUP_DIR/dotfiles" | sed 's/^/- /' >> "$MANIFEST"
-echo "" >> "$MANIFEST"
-
-#==============================================================================
-# 2. SEGREDOS (criptografado)
-#==============================================================================
-section "Empacotando segredos (SSH, AWS, kube, docker, gnupg, terraform, zsh_secrets)"
-
-SECRETS_STAGE="$(mktemp -d)"
-trap 'rm -rf "$SECRETS_STAGE"' EXIT
-
-secret_paths_found=()
-copy_if_exists() {
-    local src="$1" dst="$2"
-    if [ -e "$src" ]; then
-        mkdir -p "$(dirname "$SECRETS_STAGE/$dst")"
-        # rsync em vez de cp -rp: nao aborta o backup inteiro (sob set -e) se
-        # encontrar algo que nao da pra copiar (ex: socket do gpg-agent dentro
-        # de ~/.gnupg se ele estiver rodando na hora do backup) - so pula o
-        # que nao consegue e segue. O "if" tambem suspende o set -e para essa
-        # chamada especifica, entao uma falha aqui nunca mata o script todo.
-        if [ -d "$src" ]; then
-            if rsync -a "$src/" "$SECRETS_STAGE/$dst/" 2>/dev/null; then
-                secret_paths_found+=("$dst")
-            else
-                warn "Falha ao copiar '$src' para o bundle de segredos (pulando, backup continua)"
-            fi
-        else
-            if cp -p "$src" "$SECRETS_STAGE/$dst" 2>/dev/null; then
-                secret_paths_found+=("$dst")
-            else
-                warn "Falha ao copiar '$src' para o bundle de segredos (pulando, backup continua)"
-            fi
-        fi
-    fi
-}
-
-copy_if_exists "$HOME/.ssh"            "ssh"
-copy_if_exists "$HOME/.aws"            "aws"
-copy_if_exists "$HOME/.kube/config"    "kube/config"
-copy_if_exists "$HOME/.docker/config.json" "docker/config.json"
-copy_if_exists "$HOME/.gnupg"          "gnupg"
-copy_if_exists "$HOME/.terraform.d"    "terraform.d"
-copy_if_exists "$HOME/.zsh_secrets"    "zsh_secrets"
-copy_if_exists "$HOME/tfc-github-key"        "extra/tfc-github-key"
-copy_if_exists "$HOME/tfc-github-key.pub"    "extra/tfc-github-key.pub"
-
-# DBeaver guarda conexoes/senhas de banco em ~/.local/share/DBeaverData/workspace6/.../
-# (pasta "secure" tem credenciais). Vai no bundle criptografado, nao em data/.
-copy_if_exists "$HOME/.local/share/DBeaverData" "dbeaver/DBeaverData"
-
-# Perfis de VPN importados no openvpn3 nao ficam em nenhum arquivo de config
-# comum - precisam ser extraidos via "config-dump" um a um.
-if command -v openvpn3 >/dev/null 2>&1; then
-    mkdir -p "$SECRETS_STAGE/openvpn3"
-    while IFS= read -r vpn_name; do
-        [ -z "$vpn_name" ] && continue
-        openvpn3 config-dump -c "$vpn_name" > "$SECRETS_STAGE/openvpn3/${vpn_name}.ovpn" 2>/dev/null \
-            && secret_paths_found+=("openvpn3/${vpn_name}.ovpn")
-    done < <(openvpn3 configs-list 2>/dev/null | tail -n +3 | grep -v '^-*$' | awk '{print $1}')
-fi
-
-# Conexoes VPN do NetworkManager (Configuracoes > Rede > VPN - diferente do
-# openvpn3 acima). Certificados TLS ficam em ~/.cert/nm-openvpn (nivel de
-# usuario, sem sudo); ja o "nmcli connection export" pede sudo pra ler os
-# metadados da conexao em si. Sem senha guardada normalmente (NetworkManager
-# pede na hora de conectar) - so os certificados/config sao migraveis aqui.
-if command -v nmcli >/dev/null 2>&1; then
-    mkdir -p "$SECRETS_STAGE/networkmanager-vpn"
-    while IFS=: read -r vpn_name vpn_type; do
-        [ "$vpn_type" = "vpn" ] || continue
-        [ -z "$vpn_name" ] && continue
-        if sudo -n true 2>/dev/null || sudo -v 2>/dev/null; then
-            if sudo nmcli connection export "$vpn_name" "$SECRETS_STAGE/networkmanager-vpn/${vpn_name}.ovpn" 2>/dev/null; then
-                sudo chown "$(id -u):$(id -g)" "$SECRETS_STAGE/networkmanager-vpn/${vpn_name}.ovpn" 2>/dev/null || true
-                secret_paths_found+=("networkmanager-vpn/${vpn_name}.ovpn")
-                info "✓ conexão NetworkManager VPN exportada: $vpn_name"
-            else
-                warn "Falha ao exportar conexão NetworkManager VPN '$vpn_name'"
-            fi
-        else
-            warn "Sem sudo disponível - pulando exportação da VPN NetworkManager '$vpn_name'"
-        fi
-    done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null)
-fi
-copy_if_exists "$HOME/.cert/nm-openvpn" "cert/nm-openvpn"
-
-# Guarda o $HOME de origem para o restore conseguir reescrever os paths de
-# certificado dentro dos .ovpn exportados acima, caso o usuario Linux seja
-# diferente na maquina nova (ex: "mussi" -> "yuri-mussi").
-echo "$HOME" > "$BACKUP_DIR/inventory/source-home.txt"
-
-# PATs opcionais que o usuario queira incluir para automatizar auth na maquina
-# nova (ex: gh, terraform cloud). So entram se o arquivo existir - nunca gerados.
-copy_if_exists "$HOME/.config/gh/hosts.yml"        "gh/hosts.yml"
-copy_if_exists "$HOME/.terraformrc"                "extra/.terraformrc"
-
-# Claude Code: credenciais (~/.claude.json e ~/.claude/.credentials.json) e
-# historico/config (~/.claude - conversas, projects, settings, plugins).
-# Fica no bundle criptografado por ter tokens de auth + conteudo de conversas
-# que pode incluir codigo/infra sensivel de cliente. Exclui subpastas que sao
-# so cache/regeneravel (nao valem o espaco).
-copy_if_exists "$HOME/.claude.json" "claude/.claude.json"
-if [ -d "$HOME/.claude" ]; then
-    mkdir -p "$SECRETS_STAGE/claude/dotclaude"
-    if rsync -a \
-        --exclude cache/ --exclude downloads/ --exclude session-env/ \
-        --exclude shell-snapshots/ --exclude file-history/ --exclude paste-cache/ \
-        "$HOME/.claude/" "$SECRETS_STAGE/claude/dotclaude/" 2>/dev/null; then
-        secret_paths_found+=("claude/dotclaude (historico de conversas + credenciais do Claude Code)")
-    else
-        warn "Falha ao copiar ~/.claude para o bundle de segredos (pulando, backup continua)"
-    fi
-fi
-
-# Historico do terminal. Vai no bundle criptografado (nao em dotfiles/ em
-# texto puro) porque comando digitado direto no terminal as vezes carrega
-# senha/token colado sem querer (ja aconteceu antes com VPN/API key deste
-# usuario em aliases).
-copy_if_exists "$HOME/.zsh_history"  "history/.zsh_history"
-copy_if_exists "$HOME/.bash_history" "history/.bash_history"
-
-if [ "${#secret_paths_found[@]}" -eq 0 ]; then
-    warn "Nada encontrado para o bundle de segredos, pulando."
-else
-    info "Itens no bundle de segredos: ${secret_paths_found[*]}"
-
-    TAR_PATH="$(mktemp -u).tar"
-    if ! tar -C "$SECRETS_STAGE" -cf "$TAR_PATH" .; then
-        error "Falha ao empacotar os segredos em tar. secrets.tar.gpg NÃO será criado."
-        error "O restante do backup (dotfiles, inventário, dados) ainda vai continuar."
-        rm -f "$TAR_PATH"
-        TAR_PATH=""
-    fi
-
-    if [ -n "$TAR_PATH" ] && [ -f "$TAR_PATH" ]; then
-        info "Digite uma senha para criptografar o bundle de segredos (sera pedida de novo no restore)."
-        while true; do
-            read -r -s -p "Senha: " PASS1; echo
-            read -r -s -p "Confirme a senha: " PASS2; echo
-            if [ -z "$PASS1" ]; then
-                warn "Senha vazia nao e permitida."
-                continue
-            fi
-            if [ "$PASS1" = "$PASS2" ]; then
-                break
-            fi
-            warn "Senhas nao conferem, tente novamente."
-        done
-
-        if gpg --batch --yes --pinentry-mode loopback --passphrase "$PASS1" \
-            --symmetric --cipher-algo AES256 -o "$BACKUP_DIR/secrets.tar.gpg" "$TAR_PATH"; then
-            info "✅ secrets.tar.gpg criado (AES256, protegido por senha)"
-        else
-            error "Falha ao criptografar o bundle de segredos com gpg. secrets.tar.gpg NÃO foi criado."
-            error "O restante do backup ainda vai continuar."
-        fi
-        unset PASS1 PASS2
-        shred -u "$TAR_PATH" 2>/dev/null || rm -f "$TAR_PATH"
-    fi
-    {
-        echo "## Segredos (secrets.tar.gpg, criptografado AES256)"
-        printf -- '- %s\n' "${secret_paths_found[@]}"
-        echo ""
-        echo "> Guarde a senha em um cofre de senhas. Sem ela o backup de segredos e inutil."
-        echo ""
-    } >> "$MANIFEST"
-fi
-
-rm -rf "$SECRETS_STAGE"
-trap - EXIT
-
-#==============================================================================
-# 3. INVENTARIO (pacotes, extensoes, envs conda, versao node, gnome, crontab)
-#==============================================================================
-section "Gerando inventario de pacotes e configuracoes"
-
-INV="$BACKUP_DIR/inventory"
-
-apt-mark showmanual > "$INV/apt-manual.txt" 2>/dev/null || true
-info "✓ pacotes apt (manuais): $(wc -l < "$INV/apt-manual.txt" 2>/dev/null || echo 0)"
-
-command -v snap >/dev/null 2>&1 && snap list 2>/dev/null | tail -n +2 | awk '{print $1}' > "$INV/snap-list.txt" || true
-info "✓ pacotes snap: $(wc -l < "$INV/snap-list.txt" 2>/dev/null || echo 0)"
-
-# Extrai nomes de pacotes de "npm ls -g --parseable", preservando o escopo
-# (ex: /.../node_modules/@google/gemini-cli -> "@google/gemini-cli"; um
-# basename() simples cortaria o "@google/" e quebraria o "npm install -g" no
-# restore, tentando instalar um pacote com nome errado/inexistente).
-extract_npm_names() {
-    while IFS= read -r path; do
-        [ -z "$path" ] && continue
-        local parent; parent="$(basename "$(dirname "$path")")"
-        local name; name="$(basename "$path")"
-        if [[ "$parent" == @* ]]; then
-            echo "${parent}/${name}"
-        else
-            echo "$name"
-        fi
-    done
-}
-
-if command -v npm >/dev/null 2>&1; then
-    npm ls -g --depth=0 --parseable 2>/dev/null | tail -n +2 | extract_npm_names > "$INV/npm-global.txt" || true
-fi
-# Alem do npm ativo (ex: gerenciado por nvm), tambem capturamos o npm do
-# sistema (/usr/bin/npm, via apt), pois instalacoes feitas com "sudo npm
-# install -g" caem la (sudo ignora o PATH/shims do nvm) e ficariam de fora.
-if [ -x /usr/bin/npm ] && [ "$(command -v npm 2>/dev/null)" != "/usr/bin/npm" ]; then
-    /usr/bin/npm ls -g --depth=0 --parseable 2>/dev/null | tail -n +2 | extract_npm_names >> "$INV/npm-global.txt" || true
-fi
-if [ -f "$INV/npm-global.txt" ]; then
-    sort -u -o "$INV/npm-global.txt" "$INV/npm-global.txt"
-    info "✓ pacotes npm globais (nvm + sistema): $(wc -l < "$INV/npm-global.txt")"
-fi
-
-if command -v code >/dev/null 2>&1; then
-    code --list-extensions > "$INV/vscode-extensions.txt" 2>/dev/null || true
-    info "✓ extensoes VS Code: $(wc -l < "$INV/vscode-extensions.txt" 2>/dev/null || echo 0)"
-fi
-
-# Config do VS Code (so o que e leve e util: settings/keybindings/snippets).
-# globalStorage/History/workspaceStorage sao cache pesado e regeneravel, entao
-# ficam de fora de proposito.
-if [ -d "$HOME/.config/Code/User" ]; then
-    mkdir -p "$INV/vscode-user"
-    for f in settings.json keybindings.json; do
-        [ -f "$HOME/.config/Code/User/$f" ] && cp -p "$HOME/.config/Code/User/$f" "$INV/vscode-user/$f"
-    done
-    [ -d "$HOME/.config/Code/User/snippets" ] && cp -rp "$HOME/.config/Code/User/snippets" "$INV/vscode-user/snippets"
-    info "✓ configuração do VS Code (settings/keybindings/snippets)"
-fi
-
-if command -v node >/dev/null 2>&1; then
-    node --version > "$INV/node-version.txt"
-    info "✓ versao node: $(cat "$INV/node-version.txt")"
-fi
-
-CONDA_BIN="$HOME/miniconda3/bin/conda"
-if [ -x "$CONDA_BIN" ]; then
-    while IFS= read -r env_name; do
-        [ "$env_name" = "base" ] && continue
-        [ -z "$env_name" ] && continue
-        "$CONDA_BIN" env export -n "$env_name" --no-builds > "$INV/conda/${env_name}.yml" 2>/dev/null \
-            && info "✓ conda env exportado: $env_name" \
-            || warn "Falha ao exportar conda env: $env_name"
-    done < <("$CONDA_BIN" env list 2>/dev/null | grep -v '^#' | awk '{print $1}')
-fi
-
-if command -v dconf >/dev/null 2>&1; then
-    dconf dump / > "$INV/gnome-dconf.txt" 2>/dev/null || true
-    info "✓ configuracoes GNOME (dconf)"
-fi
-
-crontab -l > "$INV/crontab.txt" 2>/dev/null || true
-
-{
-    echo "## Inventario"
-    echo "- apt-manual.txt, snap-list.txt, npm-global.txt, vscode-extensions.txt"
-    echo "- node-version.txt: $(cat "$INV/node-version.txt" 2>/dev/null || echo 'n/a')"
-    echo "- conda/*.yml: $(ls "$INV/conda" 2>/dev/null | wc -l) ambiente(s)"
-    echo "- gnome-dconf.txt, crontab.txt"
-    echo ""
-} >> "$MANIFEST"
-
-#==============================================================================
-# 4. DADOS DO USUARIO (Documents, Pictures, projects, [Downloads opcional])
-#==============================================================================
-section "Copiando dados do usuario"
-
-RSYNC_EXCLUDES=(
-    --exclude "node_modules/" --exclude ".venv/" --exclude "venv/"
-    --exclude "__pycache__/" --exclude ".terraform/" --exclude "dist/"
-    --exclude "build/" --exclude "target/" --exclude ".next/" --exclude ".cache/"
+#------------------------------------------------------------------------------
+# Itens do HOME: grupo|caminho relativo ao HOME
+#------------------------------------------------------------------------------
+ITENS=(
+    'segredos|.ssh' 'segredos|.aws' 'segredos|.kube' 'segredos|.terraform.d'
+    'segredos|.config/rclone' 'segredos|.config/gh' 'segredos|.gnupg' 'segredos|.cert'
+    'segredos|.docker/config.json' 'segredos|.zsh_secrets' 'segredos|.claude.json'
+    'segredos|.local/share/kiro-cli/data.sqlite3'
+    'segredos|.config/jarvis-polly' 'segredos|.config/helm' 'segredos|projects/OpenVPN'
+    'config|.zshrc' 'config|.zprofile' 'config|.bashrc' 'config|.bash_profile' 'config|.profile'
+    'config|.bash_aliases' 'config|.aliases' 'config|.tmux.conf' 'config|.gitconfig'
+    'config|.zsh_history' 'config|.config/monitors.xml' 'config|.config/mimeapps.list'
+    'config|.config/Code/User/settings.json' 'config|.config/Code/User/keybindings.json'
+    'config|.config/Code/User/snippets' 'config|.config/Kiro/User/settings.json'
+    'config|.config/Kiro/User/keybindings.json' 'config|.config/Kiro/User/snippets'
+    'config|.config/remmina' 'config|.config/autostart'
+    'harness|.kiro' 'harness|.kiro-shared' 'harness|.claude'
+    'harness|.local/share/jarvis'
+    'dados|Documentos' 'dados|Documents' 'dados|Pictures'
 )
 
-sync_dir() {
-    local src="$1" name="$2"
-    shift 2
-    if [ -d "$src" ]; then
-        info "Sincronizando $name ..."
-        mkdir -p "$BACKUP_DIR/data/$name"
-        rsync -a --info=progress2 "$@" "$src"/ "$BACKUP_DIR/data/$name/" 2>/dev/null || warn "rsync teve avisos em $name (continuando)"
+# Itens de topo que sao symlink (ex.: ~/.zsh_secrets -> repo do harness) viram copia
+# real em $META/deref/, porque o tar guardaria so o link.
+DEREF_LIST="$STAGE/$META/deref.txt"; : > "$DEREF_LIST"
+
+fmt_bytes() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
+mline() { printf '%s\n' "$*" >> "$MAN"; }
+
+# Conta so o que o tar levaria (respeita os excludes)
+conta_arquivos() {
+    tar -C "$HOME" "${TAR_EXCL[@]}" -cvf /dev/null "$1" 2>/dev/null | grep -vc '/$' || true
+}
+
+# Caminhos que ja estao no tar por outro item (evita duplicar projects/OpenVPN
+# quando a pasta entra por "projetos").
+declare -A JA=()
+
+adiciona_item() {
+    local grupo="$1" rel="$2" abs="$HOME/$2"
+    [ -e "$abs" ] || [ -L "$abs" ] || return 0
+    [ -z "${JA[$rel]:-}" ] || return 0
+    JA[$rel]=1
+    local bytes files
+    if [ -L "$abs" ]; then
+        local alvo; alvo="$(readlink -f "$abs" 2>/dev/null || true)"
+        [ -e "$alvo" ] || { warn "symlink quebrado, ignorado: ~/$rel"; return 0; }
+        bytes="$(du -sb "$alvo" 2>/dev/null | cut -f1)"; files="$(find "$alvo" -type f 2>/dev/null | wc -l)"
+        printf '%s\n' "$rel" >> "$DEREF_LIST"
+        mline "$grupo | ~/$rel (symlink, entra como copia real) | $files arquivos | $(fmt_bytes "${bytes:-0}")"
+        return 0
+    fi
+    bytes="$(du -sb "${DU_EXCL[@]}" "$abs" 2>/dev/null | cut -f1 || true)"
+    files="$(conta_arquivos "$rel")"
+    printf '%s\0' "$rel" >> "$LISTA"
+    case "$grupo" in segredos|config) printf '%s\0' "$rel" >> "$LISTA_SHA" ;; esac
+    mline "$grupo | ~/$rel | $files arquivos | $(fmt_bytes "${bytes:-0}")"
+}
+
+#------------------------------------------------------------------------------
+# Projetos: so repos com mudanca nao enviada ou fora do GitHub; pastas fora do git
+# ate o limite de tamanho. Registra tambem a lista de clones para o restore.
+#------------------------------------------------------------------------------
+CLONAR="$STAGE/$META/projetos-clonar.tsv"; : > "$CLONAR"
+PROJ_MAN="$WORK/projetos.txt"; : > "$PROJ_MAN"
+
+avalia_projetos() {
+    local base="$HOME/projects" d rel motivo url eh_wt dirty ahead
+    [ -d "$base" ] || return 0
+    local -a repos=()
+    while IFS= read -r g; do repos+=("$(dirname "$g")"); done < <(find "$base" -maxdepth 4 -name .git -not -path '*/node_modules/*' 2>/dev/null | sort)
+    for d in "${repos[@]}"; do
+        rel="${d#"$HOME"/}"
+        eh_wt=false; [ -f "$d/.git" ] && eh_wt=true
+        motivo=""
+        url="$(timeout 20 git -C "$d" remote get-url origin 2>/dev/null || true)"
+        dirty="$(timeout 60 git -C "$d" status --porcelain 2>/dev/null | head -1 || true)"
+        ahead="$(timeout 60 git -C "$d" log --branches --not --remotes --oneline -1 2>/dev/null || true)"
+        if [ -n "$dirty" ]; then motivo="mudanca-local"
+        elif [ -n "$ahead" ] && ! $eh_wt; then motivo="commit-nao-enviado"
+        elif [ -z "$url" ] && ! $eh_wt; then motivo="sem-remoto"
+        elif [ -n "$url" ] && ! $eh_wt && ! printf '%s' "$url" | grep -q 'github\.com'; then motivo="fora-do-github"
+        fi
+        if [ -n "$motivo" ]; then
+            [ -z "${JA[$rel]:-}" ] || continue
+            JA[$rel]=1
+            local bytes files
+            bytes="$(du -sb "${DU_EXCL[@]}" "$d" 2>/dev/null | cut -f1 || true)"
+            files="$(conta_arquivos "$rel")"
+            printf '%s\0' "$rel" >> "$LISTA"
+            printf 'INCLUIDO | ~/%s | %s | %s arquivos | %s\n' "$rel" "$motivo" "$files" "$(fmt_bytes "${bytes:-0}")" >> "$PROJ_MAN"
+        elif ! $eh_wt && [ -n "$url" ]; then
+            printf '%s\t%s\n' "$rel" "$url" >> "$CLONAR"
+            printf 'CLONAR NO SETUP | ~/%s\n' "$rel" >> "$PROJ_MAN"
+        else
+            printf 'IGNORADO (worktree limpo; a branch vive no repo principal) | ~/%s\n' "$rel" >> "$PROJ_MAN"
+        fi
+    done
+    # Pastas de ~/projects sem nenhum .git dentro (ate 4 niveis)
+    for d in "$base"/*/; do
+        d="${d%/}"; rel="projects/$(basename "$d")"
+        [ -z "${JA[$rel]:-}" ] || continue
+        if [ -d "$d/.git" ] || [ -f "$d/.git" ]; then continue; fi
+        if find "$d" -maxdepth 4 -name .git -print -quit 2>/dev/null | grep -q .; then continue; fi
+        local mb
+        mb=$(( $(du -sb "${DU_EXCL[@]}" "$d" 2>/dev/null | cut -f1 || echo 0) / 1048576 ))
+        if [ "$mb" -le "$PROJ_MAX_MB" ]; then
+            JA[$rel]=1
+            printf '%s\0' "$rel" >> "$LISTA"
+            printf 'INCLUIDO | ~/%s | fora-do-git | %s MB\n' "$rel" "$mb" >> "$PROJ_MAN"
+        else
+            printf 'IGNORADO (fora do git, %s MB > limite %s MB) | ~/%s\n' "$mb" "$PROJ_MAX_MB" "$rel" >> "$PROJ_MAN"
+        fi
+    done
+}
+
+#------------------------------------------------------------------------------
+# Inventarios (texto, sem segredo)
+#------------------------------------------------------------------------------
+inv() { # inv ARQUIVO comando...
+    local f="$STAGE/$META/inventario/$1"; shift
+    mkdir -p "$(dirname "$f")"
+    "$@" > "$f" 2>/dev/null || { rm -f "$f"; return 0; }
+    [ -s "$f" ] || rm -f "$f"
+}
+
+coleta_inventarios() {
+    inv apt-manual.txt apt-mark showmanual
+    inv os-release.txt cat /etc/os-release
+    inv kernel.txt uname -r
+    inv home-origem.txt printf '%s\n' "$HOME"
+    inv usuario-origem.txt id -un
+    inv snap.txt bash -c "snap list | awk 'NR>1{print \$1, \$4}'"
+    command -v flatpak >/dev/null 2>&1 && inv flatpak.txt flatpak list --app --columns=application,origin
+    inv pip-user.txt python3 -m pip list --user --format=freeze
+    # shellcheck disable=SC2016
+    inv npm-global.txt bash -c 'source "$HOME/.nvm/nvm.sh" 2>/dev/null; npm ls -g --depth=0 --parseable | tail -n +2 | xargs -n1 basename'
+    [ -d "$HOME/.nvm/versions/node" ] && inv node-versoes.txt ls "$HOME/.nvm/versions/node"
+    command -v uv >/dev/null 2>&1 && inv uv-tools.txt uv tool list
+    command -v pipx >/dev/null 2>&1 && inv pipx.txt pipx list --short
+    command -v cargo >/dev/null 2>&1 && inv cargo.txt cargo install --list
+    command -v conda >/dev/null 2>&1 && inv conda-envs.txt conda env list
+    [ -x "$HOME/miniconda3/bin/conda" ] && inv conda-envs.txt "$HOME/miniconda3/bin/conda" env list
+    command -v code >/dev/null 2>&1 && inv vscode-extensoes.txt code --list-extensions
+    command -v gh >/dev/null 2>&1 && inv gh-extensoes.txt gh extension list
+    command -v dconf >/dev/null 2>&1 && inv dconf.ini dconf dump /
+    inv crontab.txt crontab -l
+    inv systemd-user-enabled.txt systemctl --user list-unit-files --state=enabled --no-pager --no-legend
+    inv systemd-sistema-enabled.txt systemctl list-unit-files --state=enabled --no-pager --no-legend
+    inv linger.txt loginctl show-user "$(id -un)" -p Linger
+    inv dkms-status.txt dkms status
+    inv zram.txt zramctl
+    inv swap.txt swapon --show
+    # shellcheck disable=SC2016
+    inv versoes-ferramentas.txt bash -c 'for c in docker node uv gh aws terraform kubectl helm k9s argocd kiro-cli claude rclone tailscale openvpn; do printf "%s: " "$c"; ( "$c" --version 2>&1 || "$c" version --client 2>&1 ) | head -1; done'
+    # units do usuario que NAO sao symlink (os symlinks para o repo do harness o install.sh recria)
+    if [ -d "$HOME/.config/systemd/user" ]; then
+        find "$HOME/.config/systemd/user" -maxdepth 2 -type f -printf '%P\n' 2>/dev/null > "$STAGE/$META/inventario/systemd-user-units-proprias.txt" || true
+        while IFS= read -r u; do printf '%s\0' ".config/systemd/user/$u" >> "$LISTA"; done < "$STAGE/$META/inventario/systemd-user-units-proprias.txt"
+        [ ! -s "$STAGE/$META/inventario/systemd-user-units-proprias.txt" ] && rm -f "$STAGE/$META/inventario/systemd-user-units-proprias.txt"
     fi
 }
 
-sync_dir "$HOME/Documents" "Documents" "${RSYNC_EXCLUDES[@]}"
-sync_dir "$HOME/Pictures"  "Pictures"
-sync_dir "$HOME/projects"  "projects" "${RSYNC_EXCLUDES[@]}"
-sync_dir "$HOME/Music"     "Music"
-sync_dir "$HOME/Desktop"   "Desktop"
-sync_dir "$HOME/Templates" "Templates"
+#------------------------------------------------------------------------------
+# Arquivos do sistema (sudo): /etc mudados + perfis de VPN do NetworkManager
+#------------------------------------------------------------------------------
+SUDO_OK=false
+prepara_sudo() {
+    if $SEM_SUDO; then SUDO_OK=false; return 0; fi
+    if $DRY_RUN; then
+        sudo -n true 2>/dev/null && SUDO_OK=true || SUDO_OK=false
+    else
+        info "Preciso do sudo para ler /etc (VPNs do NetworkManager, zram, DKMS)."
+        sudo -v || die "sudo negado; sem ele o backup perderia as VPNs do NetworkManager."
+        SUDO_OK=true
+    fi
+}
 
-echo "## Dados incluidos" >> "$MANIFEST"
-echo "- Documents, Pictures, projects, Music, Desktop, Templates" >> "$MANIFEST"
+ETC_FIXOS=(
+    /etc/systemd/zram-generator.conf /etc/systemd/zram-generator.conf.d
+    /etc/dkms /etc/docker/daemon.json /etc/hosts
+    /etc/NetworkManager/system-connections /etc/NetworkManager/conf.d
+    /etc/openvpn /etc/netplan
+)
+ETC_NAO_PACOTE=(
+    /etc/modprobe.d /etc/modules-load.d /etc/sysctl.d /etc/udev/rules.d /etc/apt/sources.list.d
+    /etc/apt/preferences.d /etc/apt/apt.conf.d /etc/sudoers.d /etc/ssh/sshd_config.d
+    /etc/security/limits.d /etc/systemd/system /etc/systemd/user /etc/systemd/logind.conf.d
+)
 
-if [ "$WITH_DOWNLOADS" = true ]; then
-    info "Sincronizando Downloads (limite ${DOWNLOADS_LIMIT_MB}MB por arquivo)..."
-    mkdir -p "$BACKUP_DIR/data/Downloads"
-    rsync -a --max-size="${DOWNLOADS_LIMIT_MB}m" "$HOME/Downloads"/ "$BACKUP_DIR/data/Downloads/" 2>/dev/null || warn "rsync teve avisos em Downloads"
-    echo "- Downloads (arquivos > ${DOWNLOADS_LIMIT_MB}MB pulados)" >> "$MANIFEST"
-else
-    warn "Downloads NAO incluido (use --with-downloads para incluir)"
-    echo "- Downloads: NAO incluido (rode com --with-downloads se precisar)" >> "$MANIFEST"
+coleta_sistema() {
+    local dest="$STAGE/$META/raiz" p f n=0
+    if ! $SUDO_OK; then
+        mline "sistema | /etc (zram, DKMS, NetworkManager, modprobe etc.) | NAO LISTADO (sem sudo: use sem --sem-sudo, ou rode "sudo -v" antes do --dry-run)"
+        return 0
+    fi
+    for p in "${ETC_FIXOS[@]}"; do
+        sudo test -e "$p" || continue
+        if $DRY_RUN; then
+            n="$(sudo find "$p" -type f 2>/dev/null | wc -l)"
+            mline "sistema | $p | $n arquivos"
+        else
+            sudo mkdir -p "$dest$(dirname "$p")"
+            sudo cp -a "$p" "$dest$(dirname "$p")/" 2>/dev/null || warn "nao copiei $p"
+            n="$(sudo find "$dest$p" -type f 2>/dev/null | wc -l)"
+            mline "sistema | $p | $n arquivos"
+        fi
+    done
+    for p in "${ETC_NAO_PACOTE[@]}"; do
+        [ -d "$p" ] || continue
+        n=0
+        while IFS= read -r f; do
+            # so o que nenhum pacote entrega (config da propria maquina)
+            dpkg -S "$f" >/dev/null 2>&1 && continue
+            [ -L "$f" ] && continue
+            n=$((n+1))
+            if ! $DRY_RUN; then
+                sudo mkdir -p "$dest$(dirname "$f")"
+                sudo cp -a "$f" "$dest$f" 2>/dev/null || warn "nao copiei $f"
+            fi
+        done < <(sudo find "$p" -maxdepth 1 -type f 2>/dev/null | sort)
+        [ "$n" -eq 0 ] || mline "sistema | $p (so arquivos fora de pacote) | $n arquivos"
+    done
+    if ! $DRY_RUN; then
+        sudo chown -R "$(id -u):$(id -g)" "$dest" 2>/dev/null || true
+        chmod -R u+rwX,go-rwx "$dest" 2>/dev/null || true
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Monta tudo
+#------------------------------------------------------------------------------
+info "Destino: $SAIDA"
+$DRY_RUN && info "Modo --dry-run: nada sera gravado."
+
+prepara_sudo
+# Itens extras da sua maquina (credenciais de trabalho etc.), fora do repo: um caminho
+# relativo ao HOME por linha, opcionalmente "grupo|caminho"; # comenta.
+EXTRAS_FILE="${BACKUP_EXTRAS_FILE:-$HOME/.config/backup-ubuntu-extras.txt}"
+if [ -f "$EXTRAS_FILE" ]; then
+    while IFS= read -r linha; do
+        linha="${linha%%#*}"; linha="${linha//[$'\r']/}"; [ -n "${linha// /}" ] || continue
+        case "$linha" in *"|"*) ITENS+=("$linha") ;; *) ITENS+=("segredos|$linha") ;; esac
+    done < "$EXTRAS_FILE"
 fi
-echo "" >> "$MANIFEST"
+for it in "${ITENS[@]}"; do adiciona_item "${it%%|*}" "${it#*|}"; done
+info "Avaliando ~/projects (git status em cada repo; pode levar alguns minutos)..."
+avalia_projetos
+coleta_inventarios
+coleta_sistema
 
-#==============================================================================
-# FIM
-#==============================================================================
-section "🎉 Backup concluido"
+# Espaco: estimativa sobre o que vai para o tar
+EST=0
+while IFS= read -r -d '' rel; do
+    s="$(du -sb "${DU_EXCL[@]}" "$HOME/$rel" 2>/dev/null | cut -f1 || echo 0)"; EST=$((EST + ${s:-0}))
+done < "$LISTA"
+LIVRE="$(df -B1 --output=avail "$DESTINO" | tail -1 | tr -d ' ')"
+FSTIPO="$(df --output=fstype "$DESTINO" | tail -1 | tr -d ' ')"
+[ "$FSTIPO" != "vfat" ] || die "o disco de destino e FAT32 (limite de 4 GB por arquivo). Formate em exFAT ou ext4."
 
-TOTAL_SIZE="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
-{
-    echo "## Tamanho total"
-    echo "$TOTAL_SIZE"
-} >> "$MANIFEST"
+monta_manifesto() {
+    local arq_info="${1:-}"
+    echo "MANIFESTO DO BACKUP - ubuntu ($NOME)"
+    echo "Gerado em: $(date '+%Y-%m-%d %H:%M:%S %z')   script: backup.sh $VERSAO_SCRIPT"
+    echo "Maquina: $HOST   usuario: $(id -un)   SO: $(. /etc/os-release; echo "$PRETTY_NAME")   kernel: $(uname -r)"
+    echo "Modo: $($DRY_RUN && echo 'DRY-RUN (nada foi gravado)' || echo 'COMPLETO')"
+    echo
+    echo "== Itens do HOME e sistema (grupo | caminho | arquivos | tamanho) =="
+    cat "$MAN"
+    echo
+    echo "== Projetos em ~/projects =="
+    echo "Regra: repo so entra se tiver mudanca nao enviada, commit nao enviado, sem remoto ou fora do GitHub;"
+    echo "os demais sao re-clonados no restore. Pasta fora do git entra ate ${PROJ_MAX_MB} MB."
+    sort "$PROJ_MAN"
+    echo "Resumo: $(grep -c '^INCLUIDO' "$PROJ_MAN" || true) incluidos, $(grep -c '^CLONAR' "$PROJ_MAN" || true) a clonar no setup, $(grep -c '^IGNORADO' "$PROJ_MAN" || true) ignorados"
+    echo
+    echo "== Inventarios (dentro do tar, em $META/inventario/) =="
+    if [ -d "$STAGE/$META/inventario" ]; then
+        for f in "$STAGE/$META/inventario"/*; do
+            [ -f "$f" ] && printf '%s (%s linhas)\n' "$(basename "$f")" "$(wc -l < "$f")"
+        done
+    fi
+    echo
+    echo "== Fora do backup, de proposito =="
+    echo "Downloads do HOME (decisao do dono)"
+    echo "Padroes excluidos: ${EXCL[*]}"
+    echo "Nao salvo (refaz no setup): login do tailscale, login do gh/aws sso, chaves MOK do DKMS, token do Kiro se expirado."
+    echo
+    echo "== Tamanho =="
+    echo "Dados a arquivar (sem compressao): $(fmt_bytes "$EST")   espaco livre no destino: $(fmt_bytes "$LIVRE")   fs: $FSTIPO"
+    [ -z "$arq_info" ] || { echo; echo "== Arquivo =="; echo "$arq_info"; }
+    echo
+    echo "== Restaurar =="
+    echo "sha256sum -c SHA256SUMS   (dentro desta pasta)"
+    echo "./ubuntu-setup-automated.sh --restore <esta pasta>   (pede a senha na hora)"
+}
 
-echo ""
-info "Backup completo em: $BACKUP_DIR"
-info "Tamanho total: $TOTAL_SIZE"
-info "Manifesto: $MANIFEST"
-echo ""
-echo "Proximos passos:"
-echo "  1. Copie a pasta '$BACKUP_DIR' para um HD externo / pendrive / scp / S3."
-echo "  2. Na maquina nova, rode:"
-echo "       ./ubuntu-setup-automated.sh /caminho/para/$(basename "$BACKUP_DIR")"
-echo "  3. Guarde a senha do secrets.tar.gpg em lugar seguro (cofre de senhas)."
-echo ""
+if $DRY_RUN; then
+    monta_manifesto
+    [ "$EST" -lt "$LIVRE" ] || warn "o destino tem menos espaco livre que o total a arquivar (sem contar compressao)."
+    info "Dry-run concluido. Nada foi gravado."
+    exit 0
+fi
+
+[ "$EST" -lt "$LIVRE" ] || die "espaco insuficiente em $DESTINO: precisa de ~$(fmt_bytes "$EST") sem compressao, livre $(fmt_bytes "$LIVRE")."
+
+#------------------------------------------------------------------------------
+# Copia dos symlinks de topo, sha256 por arquivo e senha
+#------------------------------------------------------------------------------
+mkdir -p "$STAGE/$META/deref"
+while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    mkdir -p "$STAGE/$META/deref/$(dirname "$rel")"
+    cp -aL "$HOME/$rel" "$STAGE/$META/deref/$rel"
+done < "$DEREF_LIST"
+
+if ! $RAPIDO; then
+    info "Calculando sha256 por arquivo (config e segredos)..."
+    tar --null "${TAR_EXCL[@]}" -C "$HOME" -T "$LISTA_SHA" -cvf /dev/null 2>/dev/null \
+        | grep -v '/$' | tr '\n' '\0' | (cd "$HOME" && xargs -0 -r -n50 sha256sum 2>/dev/null) \
+        > "$STAGE/$META/SHA256-ARQUIVOS.txt" || true
+fi
+
+cp "$0" "$STAGE/$META/backup.sh.usado" 2>/dev/null || true
+
+if [ ! -t 0 ]; then die "preciso de um terminal para pedir a senha."; fi
+read -rs -p "Senha do backup (nao sera gravada): " PASS; echo >&2
+read -rs -p "Repita a senha: " PASS2; echo >&2
+[ "$PASS" = "$PASS2" ] || die "as senhas nao conferem."
+PASS2=""
+[ "${#PASS}" -ge 10 ] || die "use uma senha com pelo menos 10 caracteres (o arquivo leva chaves e tokens)."
+
+#------------------------------------------------------------------------------
+# Tar -> gpg direto para o disco (sem copia intermediaria em claro)
+#------------------------------------------------------------------------------
+mkdir -p "$SAIDA.parcial"
+ALVO="$SAIDA.parcial/backup.tar.gpg"
+info "Arquivando e cifrando (pode levar bastante; ~$(fmt_bytes "$EST"))..."
+
+set +e
+tar --null --warning=no-file-changed --warning=no-file-ignored --ignore-failed-read \
+    "${TAR_EXCL[@]}" -cf - -C "$HOME" -T "$LISTA" -C "$STAGE" "$META" 2>"$WORK/tar.err" \
+  | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --symmetric \
+        --cipher-algo AES256 --s2k-mode 3 --s2k-digest-algo SHA512 --s2k-count 65011712 \
+        -z 1 -o "$ALVO" 3< <(printf '%s' "$PASS") 2>"$WORK/gpg.err"
+RC=("${PIPESTATUS[@]}")
+set -e
+PASS=""
+if [ "${RC[0]}" -gt 1 ] || [ "${RC[1]}" -ne 0 ]; then
+    erro "tar rc=${RC[0]} gpg rc=${RC[1]}"; tail -5 "$WORK/tar.err" "$WORK/gpg.err" >&2 || true
+    rm -rf "$SAIDA.parcial"; exit 1
+fi
+[ "${RC[0]}" -eq 0 ] || warn "tar terminou com aviso (arquivo mudou durante a leitura, normal em ~/.claude); backup valido."
+
+info "Calculando sha256 do arquivo cifrado..."
+( cd "$SAIDA.parcial" && sha256sum backup.tar.gpg > SHA256SUMS )
+TAM="$(stat -c %s "$ALVO")"
+SHA="$(cut -d' ' -f1 "$SAIDA.parcial/SHA256SUMS")"
+monta_manifesto "backup.tar.gpg | $(fmt_bytes "$TAM") | sha256 $SHA | cifrado gpg simetrico AES256" > "$SAIDA.parcial/MANIFESTO.txt"
+sync
+mv "$SAIDA.parcial" "$SAIDA"
+
+info "Conferindo o sha256 gravado..."
+( cd "$SAIDA" && sha256sum -c SHA256SUMS >&2 )
+info "Pronto: $SAIDA"
+info "Guarde a senha fora deste computador. Sem ela o backup nao abre."
