@@ -16,13 +16,14 @@
 #   --sem-projetos      no restore, nao re-clona os repos de ~/projects.
 #   --pular ETAPA       pula uma etapa (repetivel). Nomes: apt restore docker node uv gh aws
 #                       terraform kubectl cli-extra kiro claude cli-ia rclone tailscale vpn
-#                       apps displaylink zram playwright shell pacotes projetos harness
+#                       apps displaylink zram energia playwright shell pacotes projetos harness
 #   --so ETAPA          roda so a etapa (repetivel; "restore" tambem vale).
 #   --listar            lista as etapas e sai.
 #   -h, --help
 #
 # Variaveis opcionais: GIT_USER_NAME, GIT_USER_EMAIL (so usadas se o backup nao
-# trouxe o ~/.gitconfig), ZRAM_ALGO_0/ZRAM_ALGO_1, ZRAM_MB_0/ZRAM_MB_1,
+# trouxe o ~/.gitconfig), ZRAM_ALGO_0/ZRAM_ALGO_1, ZRAM_MB_0/ZRAM_MB_1
+# (padrao: metade da RAM, dividida entre os dois),
 # SWAP_FILE_GB (padrao 8), NODE_MAJOR (padrao 24), PY_VERSAO (padrao 3.12).
 #
 # Cada etapa checa o estado antes de agir: rodar de novo nao reinstala nem
@@ -36,8 +37,10 @@ set -uo pipefail
 NODE_MAJOR="${NODE_MAJOR:-24}"
 PY_VERSAO="${PY_VERSAO:-3.12}"
 SWAP_FILE_GB="${SWAP_FILE_GB:-8}"
-ZRAM_MB_0="${ZRAM_MB_0:-4096}"; ZRAM_ALGO_0="${ZRAM_ALGO_0:-lzo-rle}"
-ZRAM_MB_1="${ZRAM_MB_1:-4096}"; ZRAM_ALGO_1="${ZRAM_ALGO_1:-zstd}"
+# zram: ~50% da RAM, metade em cada dispositivo (16 GB -> 8 GB, 32 GB -> 16 GB); ZRAM_MB_0/1 sobrescrevem.
+RAM_MB="$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)"; RAM_MB="${RAM_MB:-8192}"
+ZRAM_MB_0="${ZRAM_MB_0:-$((RAM_MB / 4))}"; ZRAM_ALGO_0="${ZRAM_ALGO_0:-lzo-rle}"
+ZRAM_MB_1="${ZRAM_MB_1:-$((RAM_MB / 4))}"; ZRAM_ALGO_1="${ZRAM_ALGO_1:-zstd}"
 HARNESS_REPO="${HARNESS_REPO:-https://github.com/ymussi/dotfiles-claude.git}"
 HARNESS_REPO_SSH="${HARNESS_REPO_SSH:-git@github.com:ymussi/dotfiles-claude.git}"
 RESTORE_DIR="$HOME/.local/share/backup-ubuntu-restore"
@@ -55,7 +58,7 @@ secao() { echo; echo "=== $* ==="; }
 export DEBIAN_FRONTEND=noninteractive
 TMO() { timeout "$@"; }
 
-ETAPAS=(apt restore docker node uv gh aws terraform kubectl cli-extra kiro claude cli-ia rclone tailscale vpn apps displaylink zram playwright shell pacotes projetos harness)
+ETAPAS=(apt restore docker node uv gh aws terraform kubectl cli-extra kiro claude cli-ia rclone tailscale vpn apps displaylink zram energia playwright shell pacotes projetos harness)
 RESTORE_ARG=""; AUTO_RESTORE=false; SEM_PROJ=false; IGNORA_SHA=false
 declare -A PULAR=() SO=()
 FALHAS=()
@@ -99,6 +102,13 @@ executa_etapa() { # executa_etapa nome funcao
     if [ -n "${PULAR[$nome]:-}" ]; then skip "etapa pulada: $nome"; return 0; fi
     secao "$nome"
     if ! "$fn"; then warn "etapa com falha: $nome"; FALHAS+=("$nome"); fi
+}
+
+# grava_root ARQUIVO CONTEUDO: grava como root so se o conteudo mudou (0 se gravou, 1 se ja estava igual).
+grava_root() {
+    local f="$1" novo="$2"
+    if [ -f "$f" ] && [ "$(sudo cat "$f")" = "$novo" ]; then skip "$f"; return 1; fi
+    sudo install -d "$(dirname "$f")" && printf '%s\n' "$novo" | sudo tee "$f" >/dev/null && info "gravado: $f"
 }
 
 tem() { command -v "$1" >/dev/null 2>&1; }
@@ -531,7 +541,7 @@ etapa_displaylink() {
 }
 
 #==============================================================================
-# 9. zram (8 GB: zram0 4 GB lzo-rle + zram1 4 GB zstd) e swap em disco
+# 9. zram (50% da RAM: zram0 lzo-rle + zram1 zstd, metade cada) e swap em disco
 #==============================================================================
 etapa_zram() {
     apt_garante systemd-zram-generator || return 1
@@ -541,7 +551,12 @@ etapa_zram() {
     if [ -f "$conf" ] && [ "$(sudo cat "$conf")" = "$novo" ]; then skip "zram-generator.conf"; else
         printf '%s\n' "$novo" | sudo tee "$conf" >/dev/null
         sudo systemctl daemon-reload
+        info "zram: ${ZRAM_MB_0} MB + ${ZRAM_MB_1} MB (RAM ${RAM_MB} MB); se o zram ja estava ativo, o tamanho novo vale no proximo boot"
     fi
+    if grava_root /etc/sysctl.d/99-zram.conf 'vm.swappiness = 180
+vm.page-cluster = 0
+vm.watermark_boost_factor = 0
+vm.watermark_scale_factor = 125'; then sudo sysctl -q -p /etc/sysctl.d/99-zram.conf || warn "sysctl do zram nao aplicou"; fi
     local u
     for u in systemd-zram-setup@zram0.service systemd-zram-setup@zram1.service; do
         systemctl is-active --quiet "$u" 2>/dev/null || sudo systemctl start "$u" 2>/dev/null || warn "nao subiu $u (confira no proximo boot)"
@@ -562,6 +577,31 @@ etapa_zram() {
     fi
     grep -qE '^/swap\.img[[:space:]]' /etc/fstab || echo '/swap.img none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
     return 0
+}
+
+#==============================================================================
+# 9b. Energia: sempre ligado (tampa, ocioso, sleep) e alta performance
+#==============================================================================
+etapa_energia() {
+    local rc=0
+    # a regra da tampa vale no proximo boot (reiniciar o logind derruba a sessao grafica)
+    grava_root /etc/systemd/logind.conf.d/10-sempre-ligado.conf '[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+IdleAction=ignore' || true
+    sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target >/dev/null 2>&1 \
+        || { warn "nao mascarou os alvos de sleep"; rc=1; }
+    if grava_root /etc/NetworkManager/conf.d/wifi-powersave-off.conf '[connection]
+wifi.powersave = 2'; then sudo systemctl reload NetworkManager 2>/dev/null || true; fi
+    if tem powerprofilesctl; then
+        if [ "$(powerprofilesctl get 2>/dev/null)" = performance ]; then skip "perfil de energia: performance"
+        else powerprofilesctl set performance || { warn "powerprofilesctl set performance falhou"; rc=1; }; fi
+    else warn "powerprofilesctl ausente (power-profiles-daemon); perfil de energia nao ajustado"; fi
+    if tem lspci && lspci 2>/dev/null | grep -Ei 'vga|3d|display' | grep -qi intel; then
+        apt_garante intel-media-va-driver-non-free vainfo || rc=1
+    else skip "sem GPU Intel: driver de video pulado"; fi
+    return $rc
 }
 
 #==============================================================================
@@ -888,6 +928,7 @@ executa_etapa vpn etapa_vpn
 executa_etapa apps etapa_apps
 executa_etapa displaylink etapa_displaylink
 executa_etapa zram etapa_zram
+executa_etapa energia etapa_energia
 executa_etapa playwright etapa_playwright
 executa_etapa shell etapa_shell
 executa_etapa pacotes etapa_pacotes

@@ -58,7 +58,7 @@ O destino não pode estar num repo git nem no HOME: o arquivo leva segredos.
 `uv` (+ Python 3.12) → `gh` → `aws` (CLI v2, session-manager-plugin, aws_signing_helper) → `terraform` → `kubectl` (helm, k9s, argocd) →
 `cli-extra` (stern, lazygit, trivy, actionlint, kubectx) → `kiro` (CLI **e IDE**) → `claude` → `cli-ia` (Gemini CLI, xo-cli) → `rclone` →
 `tailscale` → `vpn` (openvpn3) → `apps` (Chrome, VS Code, Firefox, Telegram, Slack, Spotify, Postman, btop, DBeaver, TeamViewer) →
-`displaylink` → `zram` → `playwright` → `shell` (zsh + oh-my-zsh) → `pacotes` (reinstala as listas do backup: apt, snap, npm -g,
+`displaylink` → `zram` (50% da RAM, metade em cada dispositivo, mais `99-zram.conf`) → `energia` (nunca suspende: tampa, ocioso e sleep mascarado; Wi-Fi sem powersave; perfil performance; driver de vídeo Intel só se houver GPU Intel) → `playwright` → `shell` (zsh + oh-my-zsh) → `pacotes` (reinstala as listas do backup: apt, snap, npm -g,
 extensões do VS Code e do Kiro, pip, uv, pipx, gh, dconf, cron) → `projetos` (clona os repos que não estavam no tar) →
 `harness` (clona `dotfiles-claude`, roda o `install.sh`, liga linger e as units que estavam ligadas).
 
