@@ -10,13 +10,22 @@
 #                       CAMINHO e a pasta backup-ubuntu-<host>-<data> (ou o
 #                       backup.tar.gpg dentro dela). A senha e pedida na hora.
 #   --ignorar-sha256    segue o restore mesmo sem SHA256SUMS (por padrao a falta dele e erro).
+#   --refazer-restore   decifra e extrai de novo mesmo que o restore ja tenha concluido antes
+#                       (por padrao um restore concluido e pulado: nao pede senha nem le 30 GB de novo).
+#   --delta ARQUIVO     depois do restore principal, restaura o pacote delta cifrado (tar.gpg com o que
+#                       mudou depois do backup). SOBRESCREVE os arquivos (o delta e mais novo) e roda
+#                       uma vez so. "--delta auto" procura delta-pos-backup-*.tar.gpg ao lado da pasta
+#                       do backup principal.
+#   --limpa-efi-windows remove a entrada "Windows Boot Manager" (efibootmgr) e EFI/Microsoft da ESP.
+#                       So com esta opcao, so com terminal, e so depois de voce digitar APAGAR.
 #   --auto-restore      procura backup-ubuntu-* em /media/$USER/* e usa o mais novo.
 #   --sem-harness       nao clona o dotfiles-claude nem roda o install.sh dele.
 #   --sem-displaylink   pula o driver DisplayLink (dock USB).
 #   --sem-projetos      no restore, nao re-clona os repos de ~/projects.
 #   --pular ETAPA       pula uma etapa (repetivel). Nomes: apt restore docker node uv gh aws
 #                       terraform kubectl cli-extra kiro claude cli-ia rclone tailscale vpn
-#                       apps displaylink zram energia playwright shell pacotes projetos harness
+#                       apps displaylink zram energia playwright shell pacotes projetos
+#                       git-integridade harness efi-windows delta
 #   --so ETAPA          roda so a etapa (repetivel; "restore" tambem vale).
 #   --listar            lista as etapas e sai.
 #   -h, --help
@@ -24,7 +33,13 @@
 # Variaveis opcionais: GIT_USER_NAME, GIT_USER_EMAIL (so usadas se o backup nao
 # trouxe o ~/.gitconfig), ZRAM_ALGO_0/ZRAM_ALGO_1, ZRAM_MB_0/ZRAM_MB_1
 # (padrao: metade da RAM, dividida entre os dois),
-# SWAP_FILE_GB (padrao 8), NODE_MAJOR (padrao 24), PY_VERSAO (padrao 3.12).
+# SWAP_FILE_GB (padrao 8), NODE_MAJOR (padrao 24), PY_VERSAO (padrao 3.12),
+# SNAP_TMO (segundos por snap; padrao 300), SNAP_PULAR (snaps a nao instalar, separados por espaco;
+# ex.: SNAP_PULAR=spotify se o snap travar de novo).
+#
+# Se uma etapa travar ou falhar por motivo externo (ex.: um snap), rode de novo com --pular <etapa>.
+# Depois de um restore concluido, repita o comando com --pular restore (ou nada: o restore concluido
+# e pulado sozinho).
 #
 # Cada etapa checa o estado antes de agir: rodar de novo nao reinstala nem
 # sobrescreve nada. Falha numa etapa e registrada e o script segue; o resumo no
@@ -37,6 +52,8 @@ set -uo pipefail
 NODE_MAJOR="${NODE_MAJOR:-24}"
 PY_VERSAO="${PY_VERSAO:-3.12}"
 SWAP_FILE_GB="${SWAP_FILE_GB:-8}"
+SNAP_TMO="${SNAP_TMO:-300}"
+SNAP_PULAR="${SNAP_PULAR:-}"
 # zram: ~50% da RAM, metade em cada dispositivo. A MemTotal e arredondada para cima em multiplo de 2 GiB
 # (o kernel reserva um pouco: 32 GB marca ~31264 MB), entao 16 GB -> 8 GB no total e 32 GB -> 16 GB.
 # ZRAM_MB_0/1 sobrescrevem.
@@ -61,18 +78,22 @@ secao() { echo; echo "=== $* ==="; }
 export DEBIAN_FRONTEND=noninteractive
 TMO() { timeout "$@"; }
 
-ETAPAS=(apt restore docker node uv gh aws terraform kubectl cli-extra kiro claude cli-ia rclone tailscale vpn apps displaylink zram energia playwright shell pacotes projetos harness)
+ETAPAS=(apt restore delta docker node uv gh aws terraform kubectl cli-extra kiro claude cli-ia rclone tailscale vpn apps displaylink zram energia playwright shell pacotes projetos git-integridade harness efi-windows)
 RESTORE_ARG=""; AUTO_RESTORE=false; SEM_PROJ=false; IGNORA_SHA=false
+REFAZ_RESTORE=false; DELTA_ARG=""; LIMPA_EFI=false
 declare -A PULAR=() SO=()
 FALHAS=()
 
-uso() { sed -n '2,/^#====.*$/p' "$0" | sed -n '2,34p' | sed 's/^# \{0,1\}//'; }
+uso() { sed -n '3,/^#====.*$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --restore) shift; RESTORE_ARG="${1:-}"; [ -n "$RESTORE_ARG" ] || { erro "--restore pede um caminho"; exit 2; } ;;
         --auto-restore) AUTO_RESTORE=true ;;
         --ignorar-sha256) IGNORA_SHA=true ;;
+        --refazer-restore) REFAZ_RESTORE=true ;;
+        --delta) shift; DELTA_ARG="${1:-}"; [ -n "$DELTA_ARG" ] || { erro "--delta pede um arquivo (ou auto)"; exit 2; } ;;
+        --limpa-efi-windows) LIMPA_EFI=true ;;
         --sem-harness) PULAR[harness]=1 ;;
         --sem-displaylink) PULAR[displaylink]=1 ;;
         --sem-projetos) SEM_PROJ=true ;;
@@ -376,6 +397,28 @@ etapa_cli_extra() {
     return $rc
 }
 
+# snap com timeout: o snapd ja travou no download do spotify (restore de 06/11 no Acer, etapa apps parada ate
+# o timeout de 900 s). Passou de SNAP_TMO, aborta a mudanca pendente e segue, em vez de prender o setup.
+snap_aborta_pendentes() { # snap_aborta_pendentes nome
+    local id
+    TMO 20 snap changes 2>/dev/null | awk -v n="\"$1\"" '($2=="Doing" || $2=="Do") && index($0, n) {print $1}' | while read -r id; do
+        sudo snap abort "$id" >/dev/null 2>&1 && info "snap abort $id ($1)"
+    done
+    return 0
+}
+snap_instala() { # snap_instala nome [--classic]
+    local nome="$1" rc; shift
+    case " $SNAP_PULAR " in *" $nome "*) skip "snap $nome (SNAP_PULAR)"; return 0 ;; esac
+    snap list "$nome" >/dev/null 2>&1 && { skip "snap $nome"; return 0; }
+    TMO -k 15 "$SNAP_TMO" sudo snap install "$nome" "$@" </dev/null; rc=$?
+    [ $rc -eq 0 ] && return 0
+    if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
+        warn "snap $nome passou de ${SNAP_TMO}s: abortei a mudanca pendente do snapd e sigo. Para nao tentar de novo: SNAP_PULAR=\"$nome\" ou --pular apps."
+        snap_aborta_pendentes "$nome"
+    else warn "snap $nome falhou (rc=$rc)"; fi
+    return 1
+}
+
 #==============================================================================
 # 7b. Aplicativos de desktop: Chrome, VS Code, snaps (Slack, Spotify, Postman, btop, DBeaver)
 #     Kiro IDE: instalar a mao pelo instalador do site (nao ha repo apt estavel verificado).
@@ -392,12 +435,11 @@ etapa_apps() {
         apt_update_se_sujo || return 1
         TMO 900 sudo apt-get install -y code || rc=1
     else skip "vscode"; fi
-    local app flag
-    for app in firefox telegram-desktop slack spotify postman btop dbeaver-ce; do
-        snap list "$app" >/dev/null 2>&1 && { skip "snap $app"; continue; }
-        flag=""; [ "$app" = slack ] && flag="--classic"
-        # shellcheck disable=SC2086
-        TMO 900 sudo snap install "$app" $flag || { warn "snap $app falhou"; rc=1; }
+    local app fl
+    # spotify por ultimo: foi o que travou no restore de 06/11
+    for app in firefox telegram-desktop slack postman btop dbeaver-ce spotify; do
+        fl=(); [ "$app" = slack ] && fl=(--classic)
+        snap_instala "$app" "${fl[@]}" || rc=1
     done
     # TeamViewer (deb oficial; o pacote cria o repo apt dele)
     if ! tem teamviewer; then
@@ -711,6 +753,11 @@ etapa_restore() {
         warn "sem --restore: nada restaurado (SSH, AWS, VPN, harness e dados ficam por fazer)."
         return 0
     fi
+    local marca="$RESTORE_DIR/restore-concluido"
+    if [ -f "$marca" ] && ! $REFAZ_RESTORE; then
+        skip "restore ja concluido em $(cut -d' ' -f1 "$marca") (use --refazer-restore para decifrar e extrair de novo)"
+        return 0
+    fi
     arq="$(acha_backup "$RESTORE_ARG")" || return 1
     local dir; dir="$(dirname "$arq")"
     if [ -f "$dir/SHA256SUMS" ]; then
@@ -793,7 +840,64 @@ etapa_restore() {
         info "sha256 por arquivo: $ruins divergentes (arquivos que ja existiam antes do restore divergem de proposito)."
     fi
     rm -rf "$meta"
+    mkdir -p "$RESTORE_DIR" && printf '%s %s\n' "$(date -Is)" "$(basename "$dir")" > "$marca"
     info "restore concluido (pacotes e repos vem nas etapas pacotes e projetos)."
+    return 0
+}
+
+#==============================================================================
+# 12a. Pacote delta: o que mudou entre o backup principal e o desligamento da maquina antiga
+#      (tar.gpg cifrado a parte). Vai DEPOIS do principal e SOBRESCREVE (e mais novo); por isso
+#      roda uma vez so (marca delta-concluido) e nunca sem pedido explicito (--delta).
+#==============================================================================
+acha_delta() { # acha_delta ARQUIVO|auto
+    local a="$1" base c
+    if [ "$a" = auto ]; then
+        base="${RESTORE_ARG%/}"
+        [ -f "$base" ] && base="$(dirname "$base")"
+        if [ -n "$base" ]; then c="$(ls -t "$(dirname "$base")"/delta-pos-backup-*.tar.gpg 2>/dev/null | head -1)"; fi
+        [ -n "${c:-}" ] || c="$(ls -t /media/"$USER"/*/delta-pos-backup-*.tar.gpg /run/media/"$USER"/*/delta-pos-backup-*.tar.gpg 2>/dev/null | head -1)"
+        [ -n "$c" ] || { erro "nao achei delta-pos-backup-*.tar.gpg ao lado do backup nem em /media/$USER/*"; return 1; }
+        a="$c"
+    fi
+    [ -f "$a" ] || { erro "nao achei o delta: $a"; return 1; }
+    printf '%s' "$a"
+}
+
+etapa_delta() {
+    local marca="$RESTORE_DIR/delta-concluido" arq
+    if [ -z "$DELTA_ARG" ]; then
+        # avisa se ha um delta ao lado do backup, para nao esquecer
+        if [ -n "$RESTORE_ARG" ] && acha_delta auto >/dev/null 2>&1; then
+            warn "ha um pacote delta ao lado do backup ($(basename "$(acha_delta auto)")); para restaurar depois do principal: --delta auto"
+        else skip "delta (sem --delta)"; fi
+        return 0
+    fi
+    if [ -f "$marca" ] && ! $REFAZ_RESTORE; then
+        skip "delta ja restaurado em $(cut -d' ' -f1 "$marca") (--refazer-restore sobrescreve de novo)"; return 0
+    fi
+    case " ${FALHAS[*]:-} " in *" restore "*) erro "o restore principal falhou: o delta vai DEPOIS dele, nao restaurei."; return 1 ;; esac
+    [ -f "$RESTORE_DIR/restore-concluido" ] || warn "sem marca de restore principal concluido; o delta sobrescreve, confirme que o principal ja foi restaurado."
+    arq="$(acha_delta "$DELTA_ARG")" || return 1
+    if [ -f "$arq.sha256" ]; then
+        ( cd "$(dirname "$arq")" && sha256sum -c "$(basename "$arq").sha256" >/dev/null ) || { erro "sha256 do delta NAO confere."; return 1; }
+        info "sha256 do delta conferido."
+    else warn "sem $(basename "$arq").sha256 ao lado: so a integridade interna do gpg sera conferida."; fi
+    [ -t 0 ] || { erro "preciso de um terminal para pedir a senha do delta."; return 1; }
+    local PASS; IFS= read -rs -p "Senha do pacote delta: " PASS; echo
+    info "extraindo o delta em $HOME (sobrescreve; diretorios existentes mantem permissao)..."
+    local rc tarerr; tarerr="$(mktemp)"
+    gpg --batch --pinentry-mode loopback --passphrase-fd 3 -d "$arq" 3< <(printf '%s' "$PASS") 2>/dev/null \
+        | tar -x --no-same-owner --no-overwrite-dir -C "$HOME" 2>"$tarerr"
+    rc=("${PIPESTATUS[@]}")
+    PASS=""
+    if [ "${rc[0]}" -ne 0 ] || [ "${rc[1]}" -ne 0 ]; then
+        erro "falha ao decifrar/extrair o delta (senha errada? gpg=${rc[0]} tar=${rc[1]})"; head -10 "$tarerr" >&2; rm -f "$tarerr"; return 1
+    fi
+    rm -f "$tarerr"
+    fecha_permissoes
+    mkdir -p "$RESTORE_DIR" && printf '%s %s\n' "$(date -Is)" "$(basename "$arq")" > "$marca"
+    info "delta restaurado."
     return 0
 }
 
@@ -803,7 +907,7 @@ etapa_restore() {
 #==============================================================================
 etapa_pacotes() {
     [ -d "$INV" ] || { warn "sem inventario do backup ($INV): etapa pacotes pulada (use --restore)."; return 0; }
-    local ret=0 l nome flag have ext
+    local ret=0 l nome have ext flag
     # apt: o que foi instalado a mao la, menos pacote de sistema, kernel, bootloader e metapacote de desktop
     if [ -s "$INV/apt-manual.txt" ]; then
         l="$(grep -vE '^(linux-|grub|shim|ubuntu-|language-pack|ibus|libchewing|libpinyin|libopencc|libm17n|libotf|m17n|wbritish|bsdutils|dash$|diffutils|findutils|grep$|gzip|hostname|init$|login$|ncurses|python3-minimal|tailscale-archive|synaptics-repository)' "$INV/apt-manual.txt" || true)"
@@ -814,10 +918,8 @@ etapa_pacotes() {
     if [ -s "$INV/snap.txt" ]; then
         while read -r nome _; do
             case "$nome" in ""|bare|core*|gnome-*|gtk-common-themes|mesa-*|snapd|snapd-desktop-integration|snap-store|firmware-updater|desktop-security-center|prompting-client) continue ;; esac
-            snap list "$nome" >/dev/null 2>&1 && continue
-            flag=""; grep -qx "$nome" "$INV/snap-classic.txt" 2>/dev/null && flag="--classic"
-            # shellcheck disable=SC2086
-            TMO 900 sudo snap install "$nome" $flag </dev/null || { warn "snap $nome falhou"; ret=1; }
+            flag=(); grep -qx "$nome" "$INV/snap-classic.txt" 2>/dev/null && flag=(--classic)
+            snap_instala "$nome" "${flag[@]}" || ret=1
         done < "$INV/snap.txt"
     fi
     # npm global (nvm)
@@ -873,6 +975,47 @@ etapa_projetos() {
 }
 
 #==============================================================================
+# 12d. Integridade dos repos git depois do restore
+#      No restore de 06/11 o .git/index e um ref do dotfiles-claude viraram o texto de um arquivo do
+#      file-history do Claude (o index era hardlink dele no tar). Aqui: separa hardlinks dentro de .git
+#      (copia para inode proprio, para uma escrita no outro arquivo nao corromper o repo) e roda
+#      git status + fsck em cada repo. So le e reporta; nao apaga nada. Roda antes do harness porque
+#      o harness faz git pull.
+#==============================================================================
+git_erro_curto() { head -c 300 "$1" | head -1 | tr -cd '[:print:]'; }
+etapa_git_integridade() {
+    tem git || { warn "git ausente"; return 1; }
+    local g d f n=0 ruins=0 desfeitos=0 err rc hl
+    err="$(mktemp)"
+    while IFS= read -r g; do
+        d="${g%/.git}"; n=$((n+1))
+        hl=()
+        mapfile -d '' -t hl < <(find "$g" -type f -links +1 -print0 2>/dev/null)
+        for f in "${hl[@]}"; do
+            cp -p -- "$f" "$f.sep.$$" && mv -f -- "$f.sep.$$" "$f" && desfeitos=$((desfeitos+1))
+        done
+        GIT_OPTIONAL_LOCKS=0 TMO 60 git -C "$d" status --porcelain >/dev/null 2>"$err" </dev/null; rc=$?
+        if [ $rc -ne 0 ]; then
+            warn "git status falhou em ${d/#$HOME/\~}: $(git_erro_curto "$err")"; ruins=$((ruins+1)); continue
+        fi
+        TMO 120 git -C "$d" fsck --connectivity-only --no-progress >/dev/null 2>"$err" </dev/null; rc=$?
+        if [ $rc -eq 124 ]; then warn "git fsck passou de 120 s em ${d/#$HOME/\~} (nao conferido)"
+        elif [ $rc -ne 0 ]; then
+            warn "git fsck falhou em ${d/#$HOME/\~}: $(git_erro_curto "$err")"; ruins=$((ruins+1))
+        fi
+    done < <(TMO 120 find "$HOME" -maxdepth 5 \( -name node_modules -o -name .cache -o -name .nvm -o -name .oh-my-zsh \
+                -o -name .terraform -o -name snap -o -name .local -o -name miniconda3 \) -prune -o -type d -name .git -print -prune 2>/dev/null)
+    rm -f "$err"
+    [ "$desfeitos" -eq 0 ] || info "$desfeitos arquivo(s) dentro de .git deixaram de ser hardlink"
+    if [ "$ruins" -gt 0 ]; then
+        warn "$ruins de $n repo(s) com problema. Conserto do index/ref de remoto: guarde o .git/index (ou o ref) como .corrompido, apague-o, rode 'git fetch' e 'git reset'. Nada foi apagado por este script."
+        return 1
+    fi
+    info "$n repositorio(s) git conferidos (status + fsck), nenhum com problema"
+    return 0
+}
+
+#==============================================================================
 # 13. Harness / Jarvis / segundo cerebro: clonar dotfiles-claude (privado), install.sh, servicos e linger
 #     Pre-requisitos (README e install.sh do dotfiles-claude): git, gh logado (o login vem do backup),
 #     tmux e jq, python3 do sistema (/usr/bin/python3), Node do sistema (servicos systemd), curl e unzip,
@@ -925,9 +1068,70 @@ etapa_harness() {
 }
 
 #==============================================================================
+# 14. Entrada EFI do Windows (opcional, so com --limpa-efi-windows)
+#     Instalar o Ubuntu apagando o disco reaproveita a ESP de fabrica, que segue com a entrada "Windows
+#     Boot Manager" e a pasta EFI/Microsoft sem Windows nenhum. Aqui: confere que o Ubuntu inicia sozinho,
+#     avisa se ha NTFS/BitLocker no mesmo disco, guarda uma copia da pasta e so apaga depois de
+#     digitar APAGAR no terminal.
+#==============================================================================
+etapa_efi_windows() {
+    if ! $LIMPA_EFI; then skip "efi-windows (so roda com --limpa-efi-windows)"; return 0; fi
+    [ -d "${EFI_SYSFS:-/sys/firmware/efi}" ] || { skip "boot BIOS/legado: nao ha ESP"; return 0; }
+    tem efibootmgr || apt_garante efibootmgr || return 1
+    local esp="${ESP_DIR:-/boot/efi}"  # ESP_DIR e EFI_SYSFS: so para teste
+    mountpoint -q "$esp" || { warn "$esp nao esta montado: nada feito."; return 1; }
+    local lista entradas ms=false
+    lista="$(sudo efibootmgr 2>/dev/null)" || { warn "efibootmgr falhou"; return 1; }
+    entradas="$(printf '%s\n' "$lista" | grep -iE '^Boot[0-9A-F]{4}\*? +Windows Boot Manager' || true)"
+    sudo test -d "$esp/EFI/Microsoft" && ms=true
+    if [ -z "$entradas" ] && ! $ms; then skip "sem entrada nem pasta do Windows na ESP"; return 0; fi
+    # trava: o Ubuntu precisa ter entrada propria e loader na ESP, senao apagar o Windows deixa sem boot
+    if ! printf '%s\n' "$lista" | grep -qiE '^Boot[0-9A-F]{4}\*? +ubuntu' \
+        || ! { sudo test -e "$esp/EFI/ubuntu/shimx64.efi" || sudo test -e "$esp/EFI/ubuntu/grubx64.efi"; }; then
+        erro "o Ubuntu nao tem entrada propria ou loader em $esp/EFI/ubuntu: nao mexo na entrada do Windows."; return 1
+    fi
+    local src disco ntfs=0
+    src="$(findmnt -no SOURCE "$esp" 2>/dev/null)"; disco="$(lsblk -no PKNAME "$src" 2>/dev/null | head -1)"
+    [ -n "$disco" ] && ntfs="$(lsblk -nro FSTYPE "/dev/$disco" 2>/dev/null | grep -ciE 'ntfs|bitlocker' || true)"
+    info "entradas a remover:"; printf '%s\n' "$entradas" | sed 's/^/    /'
+    $ms && info "pasta a remover: $esp/EFI/Microsoft ($(sudo du -sh "$esp/EFI/Microsoft" 2>/dev/null | cut -f1))"
+    [ "${ntfs:-0}" -eq 0 ] || warn "ha $ntfs particao(oes) NTFS/BitLocker no mesmo disco (/dev/$disco): pode haver um Windows de verdade. Confira antes de seguir."
+    [ -t 0 ] || { warn "sem terminal: nao apago a entrada do Windows sem confirmacao."; return 1; }
+    local r; IFS= read -r -p "Digite APAGAR para remover a entrada e a pasta do Windows Boot Manager (outra coisa cancela): " r
+    [ "$r" = APAGAR ] || { warn "cancelado; nada foi apagado."; return 0; }
+    mkdir -p "$RESTORE_DIR"
+    if $ms; then
+        local copia; copia="$RESTORE_DIR/EFI-Microsoft-$(date +%Y%m%d).tar"
+        sudo tar -C "$esp/EFI" -cf "$copia" Microsoft && sudo chown "$USER" "$copia" || { erro "nao consegui guardar a copia de EFI/Microsoft: nada apagado."; return 1; }
+        info "copia da pasta em $copia"
+    fi
+    local num rc=0
+    while IFS= read -r num; do
+        [ -n "$num" ] || continue
+        sudo efibootmgr -b "$num" -B >/dev/null || { warn "nao removi a entrada Boot$num"; rc=1; }
+    done < <(printf '%s\n' "$entradas" | sed -nE 's/^Boot([0-9A-F]{4}).*/\1/p')
+    $ms && { sudo rm -rf -- "$esp/EFI/Microsoft" || rc=1; }
+    [ $rc -ne 0 ] || info "entrada e pasta do Windows removidas; confira com 'sudo efibootmgr'."
+    return $rc
+}
+
+# Perfis de VPN do NetworkManager: ficam em /etc/NetworkManager/system-connections (root) e so voltam do
+# backup se ele foi feito com sudo. No restore de 06/11 nao vieram; o install.sh do harness os recria.
+confere_vpn_nm() {
+    tem nmcli || return 0
+    [ ${#SO[@]} -eq 0 ] || return 0
+    if ! TMO 20 nmcli -t -f TYPE connection show 2>/dev/null | grep -qxE 'vpn|wireguard'; then
+        warn "nenhum perfil de VPN (openvpn/wireguard) no NetworkManager. Se o backup nao os trouxe, o install.sh do harness (dotfiles-claude, harness/bin/nm-vpn-perfis) recria; sem harness, rode esse script a mao. Usuario e senha/MFA voce digita ao conectar."
+    fi
+}
+
+#==============================================================================
 # Ordem de execucao
 #==============================================================================
 echo "Ubuntu $VERSION_ID ($CODENAME, $ARCH). Idempotente: pode rodar de novo."
+# Gancho de teste: SETUP_SO_FUNCOES=1 carrega so as funcoes (testes/test-setup-funcoes.sh), sem rodar etapa.
+# shellcheck disable=SC2317
+if [ -n "${SETUP_SO_FUNCOES:-}" ]; then return 0 2>/dev/null || exit 0; fi
 if [ ${#SO[@]} -eq 0 ] && [ -z "$RESTORE_ARG" ] && ! $AUTO_RESTORE; then
     warn "Sem --restore, o setup instala so as ferramentas (SSH, AWS, VPN e harness dependem do backup)."
 fi
@@ -935,6 +1139,7 @@ sudo -v || { erro "preciso do sudo"; exit 1; }
 
 executa_etapa apt etapa_apt
 executa_etapa restore etapa_restore
+executa_etapa delta etapa_delta
 executa_etapa docker etapa_docker
 executa_etapa node etapa_node
 executa_etapa uv etapa_uv
@@ -957,7 +1162,10 @@ executa_etapa playwright etapa_playwright
 executa_etapa shell etapa_shell
 executa_etapa pacotes etapa_pacotes
 executa_etapa projetos etapa_projetos
+executa_etapa git-integridade etapa_git_integridade
 executa_etapa harness etapa_harness
+executa_etapa efi-windows etapa_efi_windows
+confere_vpn_nm
 
 echo
 if [ ${#FALHAS[@]} -eq 0 ]; then

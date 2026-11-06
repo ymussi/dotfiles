@@ -23,9 +23,22 @@ Backup completo e setup de uma máquina Ubuntu 26.10 "Stonking Stingray" (dev/De
 ./ubuntu-setup-automated.sh --restore /run/media/$USER/<disco>/backup-ubuntu-<host>-<data>
 ```
 
-`./ubuntu-setup-automated.sh --help` lista as opções (`--pular`, `--so`, `--sem-harness`, `--ignorar-sha256`...).
+`./ubuntu-setup-automated.sh --help` lista as opções (`--pular`, `--so`, `--sem-harness`, `--ignorar-sha256`, `--refazer-restore`, `--delta`, `--limpa-efi-windows`...).
 Depois do setup: logout/login (grupo docker, shell zsh) e reboot (o `claude-remote` sobe no boot).
 Destino aceito: NTFS, exFAT, ext4. FAT32 é recusado (limite de 4 GB por arquivo).
+
+## Lições do restore real (06/11/2026)
+
+| O que aconteceu | O que o setup faz agora |
+|---|---|
+| O `snap install spotify` travou na etapa `apps` (timeout de 900 s) e foi preciso cancelar e rodar de novo. | Cada snap tem timeout de `SNAP_TMO` (padrão 300 s); passou disso, aborta a mudança pendente do snapd e segue. `SNAP_PULAR="spotify"` não tenta o snap; `--pular apps` pula a etapa. O Spotify é o último da lista. |
+| Rodar o comando de novo decifrava e extraía 30 GB outra vez. | Restore concluído grava uma marca (`~/.local/share/backup-ubuntu-restore/restore-concluido`) e é pulado nas repetições. `--refazer-restore` força. |
+| O `.git/index` e um ref de um repo viraram o texto de um arquivo do `~/.claude/file-history` (o index era hardlink dele). | Etapa `git-integridade` (depois de `projetos`, antes de `harness`): separa hardlinks dentro de `.git`, roda `git status` e `git fsck --connectivity-only` em cada repo sob o HOME e lista os com problema (a etapa falha se houver). Só lê e reporta; o conserto do index ou do ref é manual (guarde como `.corrompido`, apague, `git fetch`, `git reset`). |
+| O pacote delta (o que mudou depois do backup) é um tar.gpg à parte. | `--delta ARQUIVO` (ou `--delta auto`, que procura `delta-pos-backup-*.tar.gpg` ao lado da pasta do backup) restaura **depois** do principal, pede a senha dele, sobrescreve (o delta é mais novo) e roda uma vez só (marca `delta-concluido`). Recusa se o restore principal falhou. |
+| A ESP de fábrica do Acer ficou com a entrada "Windows Boot Manager" e `EFI/Microsoft` sem Windows. | `--limpa-efi-windows` (nunca por padrão): confere que o Ubuntu tem entrada e loader próprios, avisa se há NTFS/BitLocker no mesmo disco, guarda uma cópia de `EFI/Microsoft` em `~/.local/share/backup-ubuntu-restore/`, e só remove (`efibootmgr -B` + a pasta) depois de digitar `APAGAR` no terminal. Sem terminal, não faz nada. |
+| Os perfis de VPN do NetworkManager não vieram. | Ficam em `/etc/NetworkManager/system-connections` (root): só entram no backup com sudo. No fim, o setup avisa se não há perfil `vpn`/`wireguard` no NetworkManager. O `install.sh` do harness (`harness/bin/nm-vpn-perfis`, repo privado `dotfiles-claude`) recria os perfis; certificados e chaves moram lá, não neste repo público. |
+
+Testes: `timeout 300 ./tests/test-setup-funcoes.sh` carrega só as funções (`SETUP_SO_FUNCOES=1`), com HOME temporário e `sudo`, `snap`, `efibootmgr`, `nmcli` trocados por shims. Não roda o setup, não usa sudo real nem toca a ESP.
 
 ## O que o backup leva
 
@@ -54,13 +67,13 @@ O destino não pode estar num repo git nem no HOME: o arquivo leva segredos.
 
 ## O que o setup faz, na ordem
 
-`apt` (base + extras de uso) → `restore` (devolve o backup: segredos e logins vêm antes de tudo) → `docker` → `node` (nvm + NodeSource) →
+`apt` (base + extras de uso) → `restore` (devolve o backup: segredos e logins vêm antes de tudo) → `delta` (só com `--delta`) → `docker` → `node` (nvm + NodeSource) →
 `uv` (+ Python 3.12) → `gh` → `aws` (CLI v2, session-manager-plugin, aws_signing_helper) → `terraform` → `kubectl` (helm, k9s, argocd) →
 `cli-extra` (stern, lazygit, trivy, actionlint, kubectx) → `kiro` (CLI **e IDE**) → `claude` → `cli-ia` (Gemini CLI, xo-cli) → `rclone` →
 `tailscale` → `vpn` (openvpn3) → `apps` (Chrome, VS Code, Firefox, Telegram, Slack, Spotify, Postman, btop, DBeaver, TeamViewer) →
 `displaylink` → `zram` (50% da RAM, metade em cada dispositivo, mais `99-zram.conf`) → `energia` (nunca suspende: tampa, ocioso e sleep mascarado; Wi-Fi sem powersave; perfil performance; driver de vídeo Intel só se houver GPU Intel) → `playwright` → `shell` (zsh + oh-my-zsh) → `pacotes` (reinstala as listas do backup: apt, snap, npm -g,
-extensões do VS Code e do Kiro, pip, uv, pipx, gh, dconf, cron) → `projetos` (clona os repos que não estavam no tar) →
-`harness` (clona `dotfiles-claude`, roda o `install.sh`, liga linger e as units que estavam ligadas).
+extensões do VS Code e do Kiro, pip, uv, pipx, gh, dconf, cron) → `projetos` (clona os repos que não estavam no tar) → `git-integridade` →
+`harness` (clona `dotfiles-claude`, roda o `install.sh`, liga linger e as units que estavam ligadas) → `efi-windows` (só com `--limpa-efi-windows`).
 
 Cada etapa confere o estado antes de agir; rodar de novo só refaz o que falta. Repos de terceiros sem a suite do Ubuntu novo caem para a primeira que existir entre `resolute`, `questing` e `noble` (a checagem segue redirect e recusa página de erro). Pacote do apt que não existe no release é pulado com aviso, e se a instalação em lote falhar o script tenta um a um.
 
