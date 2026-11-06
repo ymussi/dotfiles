@@ -85,6 +85,13 @@ O destino não pode estar num repo git nem no HOME: o arquivo leva segredos.
 extensões do VS Code e do Kiro, pip, uv, pipx, gh, dconf, cron) → `projetos` (clona os repos que não estavam no tar) → `git-integridade` →
 `harness` (clona `dotfiles-claude`, só na branch `main` e sem commit local fora do remoto roda o `install.sh` e liga o linger; não liga unit nenhuma por conta própria: as que estavam ligadas na origem e o `install.sh` deixa desligadas são listadas no fim, para ligar numa máquina só). O estado de guardrail do harness (`~/.claude/change-*`: aprovações registradas e a chave do bypass) não migra: o restore e o delta não o extraem → `efi-windows` (só com `--limpa-efi-windows`).
 
+O que é baixado e executado fora do apt tem versão e sha256 fixos no script (variáveis `*_V` e `*_SHA` no topo):
+AWS CLI, `aws_signing_helper`, `session-manager-plugin`, nvm, uv, helm, k9s, argocd, stern, lazygit, trivy, actionlint, rclone,
+o instalador do oh-my-zsh, a chave da Synaptics; kubectx e os plugins do zsh vêm por tag conferida contra o commit. Hash que não
+bate descarta o arquivo e a etapa falha. Ficam sem hash: os instaladores `curl | bash` do Kiro CLI e do Claude Code, o deb do Kiro IDE
+(versão lida do metadata do site), o TeamViewer (só com `--acesso-remoto`), o kubectl (versão `stable`, sha256 do próprio dl.k8s.io),
+as chaves dos repos apt (baixadas por HTTPS, sem conferir a impressão digital) e os pacotes npm/pip/uv da lista do backup.
+
 Cada etapa confere o estado antes de agir; rodar de novo só refaz o que falta. Repos de terceiros sem a suite do Ubuntu novo caem para a primeira que existir entre `resolute`, `questing` e `noble` (a checagem segue redirect e recusa página de erro). Pacote do apt que não existe no release é pulado com aviso, e se a instalação em lote falhar o script tenta um a um.
 
 Conferido em 05/11/2026 contra o índice `stonking` do archive: Docker e Tailscale têm suite própria; HashiCorp e OpenVPN3 ainda não (HashiCorp cai para `resolute`, OpenVPN3 para `resolute`); gh, Chrome, VS Code, NodeSource e DisplayLink usam suite fixa (`stable`/`nodistro`), sem depender do release.

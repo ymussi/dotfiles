@@ -381,6 +381,37 @@ echo "== acesso remoto e energia sao opt-in"
     chk "lista padrao do apt nao tem openssh-server nem xrdp" "$T/o" test ! -s "$T/o"
 )
 
+echo "== downloads com versao e sha256 fixos"
+(
+    prologo sha
+    echo conteudo > "$T/arquivo-baixado"; bom="$(sha256sum "$T/arquivo-baixado" | cut -d' ' -f1)"
+    baixa_conferido "file://$T/arquivo-baixado" "$T/dl-ok" "$bom" 10 > "$T/o" 2>&1; rc=$?
+    chk "sha256 certo: rc 0 e arquivo fica" "$T/o" bash -c "[ $rc -eq 0 ] && [ -f '$T/dl-ok' ]"
+    baixa_conferido "file://$T/arquivo-baixado" "$T/dl-ruim" "$(printf '0%.0s' {1..64})" 10 > "$T/o" 2>&1; rc=$?
+    chk "sha256 errado: rc 1, arquivo apagado" "$T/o" bash -c "[ $rc -eq 1 ] && [ ! -e '$T/dl-ruim' ] && grep -q 'NAO confere' '$T/o'"
+    baixa_conferido "file://$T/arquivo-baixado" "$T/dl-sem" "" 10 > "$T/o" 2>&1; rc=$?
+    chk "sem sha256 fixo: recusa sem baixar" "$T/o" bash -c "[ $rc -eq 1 ] && [ ! -e '$T/dl-sem' ]"
+    git init -q -b main "$T/repo-tag" && ( cd "$T/repo-tag" && echo a > a && git add a && git -c user.name=t -c user.email=t@t commit -q -m x && git tag v1 )
+    c="$(git -C "$T/repo-tag" rev-parse HEAD)"
+    git_clone_fixo "file://$T/repo-tag" v1 "$c" "$T/clone-ok" > "$T/o" 2>&1; rc=$?
+    chk "tag no commit fixo: clona" "$T/o" bash -c "[ $rc -eq 0 ] && [ -f '$T/clone-ok/a' ]"
+    git_clone_fixo "file://$T/repo-tag" v1 "$(printf 'f%.0s' {1..40})" "$T/clone-ruim" > "$T/o" 2>&1; rc=$?
+    chk "tag em outro commit: descarta o clone" "$T/o" bash -c "[ $rc -eq 1 ] && [ ! -e '$T/clone-ruim' ]"
+    ruins=0
+    for v in AWS_CLI_SHA SIGNING_HELPER_SHA SSM_PLUGIN_SHA UV_SHA HELM_SHA K9S_SHA ARGOCD_SHA STERN_SHA LAZYGIT_SHA TRIVY_SHA ACTIONLINT_SHA RCLONE_SHA; do
+        declare -n arr="$v"
+        [ "${#arr[@]}" -eq 2 ] || ruins=$((ruins+1))
+        for h in "${arr[@]}"; do [[ "$h" =~ ^[0-9a-f]{64}$ ]] || ruins=$((ruins+1)); done
+        unset -n arr
+    done
+    for h in "$NVM_SHA" "$OMZ_SHA" "$SYNAPTICS_KEYRING_SHA"; do [[ "$h" =~ ^[0-9a-f]{64}$ ]] || ruins=$((ruins+1)); done
+    [ "$ruins" -eq 0 ] && ok "todos os sha256 fixos tem 64 hex (amd64 e arm64)" || nok "sha256 fixos malformados: $ruins"
+    grep -nE 'releases/latest|/latest/|rclone-current|get-helm|ohmyzsh/master|astral\.sh/uv/install' "$SETUP" > "$T/o"
+    chk "nenhum download 'latest' ou script de branch sobrou" "$T/o" test ! -s "$T/o"
+    grep -nE '(^|[^_])baixa "?https' "$SETUP" | grep -vE 'kubectl|kiro-ide|teamviewer' > "$T/o"
+    chk "baixa sem sha256 so no kubectl (sha256 do proprio dl.k8s.io), Kiro IDE e TeamViewer" "$T/o" test ! -s "$T/o"
+)
+
 echo "== perfis de VPN do NetworkManager"
 (
     prologo vpn

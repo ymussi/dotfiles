@@ -68,6 +68,40 @@ ZRAM_MB_0="${ZRAM_MB_0:-$((RAM_MB / 4))}"; ZRAM_ALGO_0="${ZRAM_ALGO_0:-lzo-rle}"
 ZRAM_MB_1="${ZRAM_MB_1:-$((RAM_MB / 4))}"; ZRAM_ALGO_1="${ZRAM_ALGO_1:-zstd}"
 HARNESS_REPO="${HARNESS_REPO:-https://github.com/ymussi/dotfiles-claude.git}"
 HARNESS_REPO_SSH="${HARNESS_REPO_SSH:-git@github.com:ymussi/dotfiles-claude.git}"
+# Versao fixa e sha256 de tudo que e baixado e executado fora do apt. Conferidos em 06/11/2026: os hashes vem do
+# arquivo de checksums publicado no proprio release (k9s, stern, lazygit, trivy, actionlint, argocd, helm, uv, rclone)
+# ou do download, quando o fornecedor nao publica (aws cli, aws_signing_helper, session-manager-plugin, nvm,
+# oh-my-zsh, chave da Synaptics). Trocar a versao exige trocar os hashes.
+AWS_CLI_V=2.39.5
+AWS_CLI_SHA=(fe0553306b3d001d162bc193d3b040027aab3466b9f910b50e702c122c0f3ff9 ce7b03ebceed1dc6a0a8f27134a41a9a3b5671f09c57ab2e7fc6d43710dbaef3)
+SIGNING_HELPER_V=1.8.5
+SIGNING_HELPER_SHA=(beec9ed1c492d93db809890f16713e3556353294b823c2184ad4e891f1b2b54d 3d131aa888cd56da446f9c6bb460b1f0569f6c7edc74eae6193a2fe3928883ba)
+SSM_PLUGIN_V=1.2.896.0
+SSM_PLUGIN_SHA=(53f51fcc67314a4bf85888a38a3967cd41f8d0f28a60a9469a63acf935ba713e 914eeca87b18b55356c58be197080f73742b3ca60d3823f0a45670dc9056aa9c)
+NVM_V=v0.40.3; NVM_SHA=2d8359a64a3cb07c02389ad88ceecd43f2fa469c06104f92f98df5b6f315275f
+UV_V=0.13.7
+UV_SHA=(c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83 71279f8d3c67241e807b9d8db872d1bf541579fb9f08b7d1eb1682196d1e57dc)
+HELM_V=v3.22.1
+HELM_SHA=(896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea 4c29e286b279d170fa048ddfc3e4e83dcd069ca9c52102766ba672d7149e694d)
+K9S_V=v0.51.0
+K9S_SHA=(c3752ad51a5a4015a113819c4eeb6e55a4d0e4b8e652494797532f6fc8161dd7 3ee05c82e5f9198928a4e86133608ba6a2c10a2244d6a7789e820f78319d640c)
+ARGOCD_V=v3.6.1
+ARGOCD_SHA=(46d2fc941071f0a0c36326a67a431d34b1479e1a24737f7b367abc93968beadc 6636e9183de7dba666b673a417986e7ff54dbadd948b2f9f6c83bcf7d33ebb94)
+STERN_V=v1.35.0
+STERN_SHA=(03729b01a8fcfab25f6ea53389bd38bc37400ff86d90cd2dcda541f248cf843e b12f5e2ee0d01f6f21e0759cced0be2d8df9cd4e93e6a3cf11393170ae0f43cf)
+LAZYGIT_V=v0.66.2
+LAZYGIT_SHA=(158efc9ddfa1241fab5fb3526bb442c8dc6c4b1904d73213b9e4e93e03c52034 79a3161eeb642f0473e23db6341f7baabd4a5933e921a9c1167c5d5c765c41a4)
+TRIVY_V=v0.76.2
+TRIVY_SHA=(bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3)
+ACTIONLINT_V=v1.7.12
+ACTIONLINT_SHA=(8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6)
+RCLONE_V=v1.76.0
+RCLONE_SHA=(b00f00b3266c3764413afe599d3ec316f6f43b3e0ea8a0bc1d186d2133e46df7 ee169016675e23a69d77240565133ff7dbc9b33d16fa8f7053d4af39f1eaeb78)
+KUBECTX_V=v0.9.5; KUBECTX_COMMIT=92e5b5f43b94b06bc38b0fbde1ee51e00079c39c
+OMZ_COMMIT=cca3bdfbef8c52ef8939ce7911ff68852b949daa; OMZ_SHA=5574b96e94dbcb769f0d1592fa83aeb6ca2caf41c6ae5d76fcc7f04c524b4f55
+ZSH_PLUGINS=("zsh-users/zsh-syntax-highlighting 0.8.0 db085e4661f6aafd24e5acb5b2e17e4dd5dddf3e"
+             "zsh-users/zsh-autosuggestions v0.7.1 e52ee8ca55bcc56a17c828767a3f98f22a68d4eb")
+SYNAPTICS_KEYRING_SHA=f83300928848f2f7605ff8438467267019c7cc5181ec8b9eabc7f1e05cbfacbe
 RESTORE_DIR="$HOME/.local/share/backup-ubuntu-restore"
 INV="$RESTORE_DIR/inventario"
 HARNESS_DIR="${HARNESS_DIR:-$HOME/projects/dotfiles-claude}"
@@ -223,7 +257,25 @@ APT_SUJO=false
 apt_update_se_sujo() { if $APT_SUJO; then TMO 600 sudo apt-get update -y && APT_SUJO=false; fi; }
 
 baixa() { TMO "${3:-300}" curl -fsSL --retry 3 -o "$2" "$1"; }
-gh_tag() { TMO 30 curl -fsSL "https://api.github.com/repos/$1/releases/latest" 2>/dev/null | grep -oP '"tag_name": *"\K[^"]+' | head -1; }
+# baixa_conferido URL DESTINO SHA256 [timeout]: so fica com o arquivo se o sha256 bater com o fixo no script.
+baixa_conferido() {
+    local url="$1" dst="$2" sha="$3" got
+    [ -n "$sha" ] || { erro "sem sha256 fixo para $url"; return 1; }
+    baixa "$url" "$dst" "${4:-300}" || { warn "nao baixei $url"; return 1; }
+    got="$(sha256sum "$dst" | cut -d' ' -f1)"
+    [ "$got" = "$sha" ] && return 0
+    erro "sha256 NAO confere, arquivo descartado: $url (esperado $sha, veio $got)"; rm -f -- "$dst"; return 1
+}
+# por_arch SHA_AMD64 SHA_ARM64: o valor da arquitetura desta maquina
+por_arch() { if [ "$ARCH" = arm64 ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+# git_clone_fixo URL TAG COMMIT DESTINO: clona a tag e so aceita se ela apontar para o commit fixo.
+git_clone_fixo() {
+    local url="$1" tag="$2" commit="$3" dst="$4" got
+    TMO 120 git clone -q --depth 1 --branch "$tag" "$url" "$dst" </dev/null 2>/dev/null || { warn "nao clonei $url ($tag)"; return 1; }
+    got="$(git -C "$dst" rev-parse HEAD 2>/dev/null)"
+    [ "$got" = "$commit" ] && return 0
+    erro "$url $tag aponta para $got, esperado $commit: descartado"; rm -rf -- "$dst"; return 1
+}
 tmpd() { mktemp -d "${TMPDIR:-/tmp}/setup.XXXXXX"; }
 
 #==============================================================================
@@ -280,8 +332,10 @@ etapa_docker() {
 etapa_node() {
     export NVM_DIR="$HOME/.nvm"
     if [ ! -s "$NVM_DIR/nvm.sh" ]; then
-        local tag; tag="$(gh_tag nvm-sh/nvm)"; tag="${tag:-v0.40.3}"
-        TMO 300 bash -c "curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/$tag/install.sh | PROFILE=/dev/null bash" || return 1
+        local d; d="$(tmpd)"
+        baixa_conferido "https://raw.githubusercontent.com/nvm-sh/nvm/$NVM_V/install.sh" "$d/nvm-install.sh" "$NVM_SHA" 60 \
+            && PROFILE=/dev/null TMO 300 bash "$d/nvm-install.sh" </dev/null || { rm -rf "$d"; return 1; }
+        rm -rf "$d"
     else skip "nvm"; fi
     # shellcheck disable=SC1091
     . "$NVM_DIR/nvm.sh"
@@ -301,7 +355,11 @@ etapa_node() {
 #==============================================================================
 etapa_uv() {
     if ! tem uv && [ ! -x "$HOME/.local/bin/uv" ]; then
-        TMO 300 bash -c 'curl -fsSL https://astral.sh/uv/install.sh | UV_NO_MODIFY_PATH=1 sh' || return 1
+        local d t; d="$(tmpd)"; t="uv-${ARCH_ALT}-unknown-linux-gnu"
+        baixa_conferido "https://github.com/astral-sh/uv/releases/download/$UV_V/$t.tar.gz" "$d/uv.tgz" "$(por_arch "${UV_SHA[@]}")" 300 \
+            && tar -xzf "$d/uv.tgz" -C "$d" && mkdir -p "$HOME/.local/bin" \
+            && install -m 0755 "$d/$t/uv" "$d/$t/uvx" "$HOME/.local/bin/" || { rm -rf "$d"; return 1; }
+        rm -rf "$d"
     else skip "uv"; fi
     export PATH="$HOME/.local/bin:$PATH"
     if ! uv python find "$PY_VERSAO" >/dev/null 2>&1; then TMO 600 uv python install "$PY_VERSAO" || return 1; else skip "python $PY_VERSAO (uv)"; fi
@@ -324,21 +382,24 @@ etapa_gh() {
 etapa_aws() {
     if tem aws && aws --version 2>&1 | grep -q 'aws-cli/2'; then skip "aws cli v2"; else
         local d; d="$(tmpd)"
-        baixa "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH_ALT}.zip" "$d/aws.zip" 600 || return 1
+        baixa_conferido "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH_ALT}-${AWS_CLI_V}.zip" "$d/aws.zip" "$(por_arch "${AWS_CLI_SHA[@]}")" 600 || { rm -rf "$d"; return 1; }
         unzip -q "$d/aws.zip" -d "$d" && TMO 300 sudo "$d/aws/install" --update || return 1
         rm -rf "$d"
     fi
     # IAM Roles Anywhere (voz do Jarvis na Polly): versao fixa, igual a desta maquina
     if ! tem aws_signing_helper && [ ! -x "$HOME/.local/bin/aws_signing_helper" ]; then
-        local sh_v="${AWS_SIGNING_HELPER_VERSAO:-1.8.5}" sh_a=X86_64; [ "$ARCH" = arm64 ] && sh_a=Aarch64
-        mkdir -p "$HOME/.local/bin"
-        baixa "https://rolesanywhere.amazonaws.com/releases/$sh_v/$sh_a/Linux/Amzn2023/aws_signing_helper" "$HOME/.local/bin/aws_signing_helper" 300 \
-            && chmod 755 "$HOME/.local/bin/aws_signing_helper" || warn "aws_signing_helper nao baixou"
+        local sh_a=X86_64 d; [ "$ARCH" = arm64 ] && sh_a=Aarch64
+        mkdir -p "$HOME/.local/bin"; d="$(tmpd)"
+        baixa_conferido "https://rolesanywhere.amazonaws.com/releases/$SIGNING_HELPER_V/$sh_a/Linux/Amzn2023/aws_signing_helper" "$d/aws_signing_helper" \
+            "$(por_arch "${SIGNING_HELPER_SHA[@]}")" 300 \
+            && install -m 0755 "$d/aws_signing_helper" "$HOME/.local/bin/aws_signing_helper" || warn "aws_signing_helper nao instalou"
+        rm -rf "$d"
     else skip "aws_signing_helper"; fi
     if ! tem session-manager-plugin; then
         local d; d="$(tmpd)"
         local arq=ubuntu_64bit; [ "$ARCH" = arm64 ] && arq=ubuntu_arm64
-        if baixa "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/$arq/session-manager-plugin.deb" "$d/ssm.deb" 300; then
+        if baixa_conferido "https://s3.amazonaws.com/session-manager-downloads/plugin/$SSM_PLUGIN_V/$arq/session-manager-plugin.deb" "$d/ssm.deb" \
+            "$(por_arch "${SSM_PLUGIN_SHA[@]}")" 300; then
             sudo apt-get install -y "$d/ssm.deb" || warn "session-manager-plugin nao instalou"
         else warn "nao baixei o session-manager-plugin"; fi
         rm -rf "$d"
@@ -370,19 +431,20 @@ etapa_kubectl() {
     else skip "kubectl"; fi
     if ! tem helm; then
         local d; d="$(tmpd)"
-        baixa https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 "$d/get-helm" 60 && TMO 300 bash "$d/get-helm" || warn "helm nao instalou"
+        baixa_conferido "https://get.helm.sh/helm-$HELM_V-linux-$ARCH_GO.tar.gz" "$d/helm.tgz" "$(por_arch "${HELM_SHA[@]}")" 300 \
+            && tar -xzf "$d/helm.tgz" -C "$d" && sudo install -m 0755 "$d/linux-$ARCH_GO/helm" "$bin/helm" || warn "helm nao instalou"
         rm -rf "$d"
     else skip "helm"; fi
     if ! tem k9s; then
-        local tag d; tag="$(gh_tag derailed/k9s)"; d="$(tmpd)"
-        if [ -n "$tag" ] && baixa "https://github.com/derailed/k9s/releases/download/$tag/k9s_Linux_${ARCH_GO}.tar.gz" "$d/k9s.tgz" 300; then
+        local d; d="$(tmpd)"
+        if baixa_conferido "https://github.com/derailed/k9s/releases/download/$K9S_V/k9s_Linux_${ARCH_GO}.tar.gz" "$d/k9s.tgz" "$(por_arch "${K9S_SHA[@]}")" 300; then
             tar -xzf "$d/k9s.tgz" -C "$d" k9s && sudo install -m 0755 "$d/k9s" "$bin/k9s"
         else warn "k9s nao instalou"; fi
         rm -rf "$d"
     else skip "k9s"; fi
     if ! tem argocd; then
         local d; d="$(tmpd)"
-        baixa "https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-$ARCH_GO" "$d/argocd" 300 \
+        baixa_conferido "https://github.com/argoproj/argo-cd/releases/download/$ARGOCD_V/argocd-linux-$ARCH_GO" "$d/argocd" "$(por_arch "${ARGOCD_SHA[@]}")" 300 \
             && sudo install -m 0755 "$d/argocd" "$bin/argocd" || warn "argocd nao instalou"
         rm -rf "$d"
     else skip "argocd"; fi
@@ -392,14 +454,12 @@ etapa_kubectl() {
 #==============================================================================
 # 6b. CLIs extras (binarios de release do GitHub, sem repo apt)
 #==============================================================================
-instala_release() { # instala_release comando repo asset(@TAG@=tag, @VER@=tag sem v) binario
-    local cmd="$1" repo="$2" asset="$3" bin="$4" tag d url
+instala_release() { # instala_release comando repo tag asset binario sha256
+    local cmd="$1" repo="$2" tag="$3" asset="$4" bin="$5" sha="$6" d url
     tem "$cmd" && { skip "$cmd"; return 0; }
-    tag="$(gh_tag "$repo")"; [ -n "$tag" ] || { warn "sem tag de $repo (rate limit do GitHub?)"; return 1; }
-    asset="${asset//@TAG@/$tag}"; asset="${asset//@VER@/${tag#v}}"
     url="https://github.com/$repo/releases/download/$tag/$asset"
     d="$(tmpd)"
-    if baixa "$url" "$d/a" 300 && tar -xzf "$d/a" -C "$d" "$bin" 2>/dev/null; then
+    if baixa_conferido "$url" "$d/a" "$sha" 300 && tar -xzf "$d/a" -C "$d" "$bin" 2>/dev/null; then
         sudo install -m 0755 "$d/$bin" "/usr/local/bin/$bin"
     else warn "$cmd nao instalou ($url)"; rm -rf "$d"; return 1; fi
     rm -rf "$d"
@@ -407,13 +467,20 @@ instala_release() { # instala_release comando repo asset(@TAG@=tag, @VER@=tag se
 
 etapa_cli_extra() {
     local rc=0
-    instala_release stern stern/stern "stern_@VER@_linux_${ARCH_GO}.tar.gz" stern || rc=1
-    instala_release lazygit jesseduffield/lazygit "lazygit_@VER@_Linux_${ARCH_ALT}.tar.gz" lazygit || rc=1
-    instala_release trivy aquasecurity/trivy "trivy_@VER@_Linux-64bit.tar.gz" trivy || rc=1
-    instala_release actionlint rhysd/actionlint "actionlint_@VER@_linux_${ARCH_GO}.tar.gz" actionlint || rc=1
+    local lg_a=x86_64 tv_a=64bit; [ "$ARCH" = arm64 ] && { lg_a=arm64; tv_a=ARM64; }
+    instala_release stern stern/stern "$STERN_V" "stern_${STERN_V#v}_linux_${ARCH_GO}.tar.gz" stern "$(por_arch "${STERN_SHA[@]}")" || rc=1
+    instala_release lazygit jesseduffield/lazygit "$LAZYGIT_V" "lazygit_${LAZYGIT_V#v}_linux_${lg_a}.tar.gz" lazygit "$(por_arch "${LAZYGIT_SHA[@]}")" || rc=1
+    instala_release trivy aquasecurity/trivy "$TRIVY_V" "trivy_${TRIVY_V#v}_Linux-${tv_a}.tar.gz" trivy "$(por_arch "${TRIVY_SHA[@]}")" || rc=1
+    instala_release actionlint rhysd/actionlint "$ACTIONLINT_V" "actionlint_${ACTIONLINT_V#v}_linux_${ARCH_GO}.tar.gz" actionlint "$(por_arch "${ACTIONLINT_SHA[@]}")" || rc=1
     if ! tem kubectx; then
-        [ -d /opt/kubectx ] || sudo git clone -q --depth 1 https://github.com/ahmetb/kubectx /opt/kubectx || rc=1
-        sudo ln -sf /opt/kubectx/kubectx /usr/local/bin/kubectx; sudo ln -sf /opt/kubectx/kubens /usr/local/bin/kubens
+        if [ ! -d /opt/kubectx ]; then
+            local d; d="$(tmpd)"
+            if git_clone_fixo https://github.com/ahmetb/kubectx "$KUBECTX_V" "$KUBECTX_COMMIT" "$d/kubectx"; then
+                sudo cp -a "$d/kubectx" /opt/kubectx && sudo chown -R root:root /opt/kubectx || rc=1
+            else rc=1; fi
+            rm -rf "$d"
+        fi
+        [ -d /opt/kubectx ] && { sudo ln -sf /opt/kubectx/kubectx /usr/local/bin/kubectx; sudo ln -sf /opt/kubectx/kubens /usr/local/bin/kubens; }
     else skip "kubectx"; fi
     return $rc
 }
@@ -511,7 +578,8 @@ etapa_rclone() {
     if tem rclone || [ -x "$HOME/.local/bin/rclone" ]; then skip "rclone"; return 0; fi
     # binario oficial (o do apt costuma estar atrasado para os remotes novos), em ~/.local/bin como nesta maquina
     local d; d="$(tmpd)"
-    if baixa "https://downloads.rclone.org/rclone-current-linux-${ARCH_GO}.zip" "$d/r.zip" 300 && unzip -q "$d/r.zip" -d "$d"; then
+    if baixa_conferido "https://downloads.rclone.org/$RCLONE_V/rclone-$RCLONE_V-linux-${ARCH_GO}.zip" "$d/r.zip" "$(por_arch "${RCLONE_SHA[@]}")" 300 \
+        && unzip -q "$d/r.zip" -d "$d"; then
         mkdir -p "$HOME/.local/bin"
         install -m 0755 "$d"/rclone-*/rclone "$HOME/.local/bin/rclone"; rm -rf "$d"; return 0
     fi
@@ -598,7 +666,7 @@ etapa_displaylink() {
     if ! pkg_instalado displaylink-driver; then
         # Repo oficial da Synaptics (DisplayLink): o pacote de chaves vem do proprio site
         local d; d="$(tmpd)"
-        baixa https://www.synaptics.com/sites/default/files/Ubuntu/pool/stable/main/all/synaptics-repository-keyring.deb "$d/k.deb" 120 \
+        baixa_conferido https://www.synaptics.com/sites/default/files/Ubuntu/pool/stable/main/all/synaptics-repository-keyring.deb "$d/k.deb" "$SYNAPTICS_KEYRING_SHA" 120 \
             && sudo apt-get install -y "$d/k.deb" || { rm -rf "$d"; return 1; }
         rm -rf "$d"
         TMO 600 sudo apt-get update -y || return 1
@@ -715,11 +783,18 @@ etapa_playwright() {
 # 11. Shell: oh-my-zsh + plugins, zsh como padrao, fzf, git
 #==============================================================================
 etapa_shell() {
-    [ -d "$HOME/.oh-my-zsh" ] || TMO 300 sh -c 'RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"' || warn "oh-my-zsh nao instalou"
-    local zc="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}" p
-    for p in zsh-users/zsh-syntax-highlighting zsh-users/zsh-autosuggestions; do
-        local n="${p#*/}"
-        [ -d "$zc/plugins/$n" ] && skip "plugin $n" || TMO 120 git clone --depth 1 "https://github.com/$p" "$zc/plugins/$n" || warn "plugin $n nao clonou"
+    if [ ! -d "$HOME/.oh-my-zsh" ]; then
+        local d; d="$(tmpd)"
+        baixa_conferido "https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/$OMZ_COMMIT/tools/install.sh" "$d/omz.sh" "$OMZ_SHA" 60 \
+            && RUNZSH=no CHSH=no KEEP_ZSHRC=yes TMO 300 sh "$d/omz.sh" </dev/null || warn "oh-my-zsh nao instalou"
+        rm -rf "$d"
+    else skip "oh-my-zsh"; fi
+    local zc="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}" pl repo tag commit
+    for pl in "${ZSH_PLUGINS[@]}"; do
+        read -r repo tag commit <<<"$pl"
+        local n="${repo#*/}"
+        [ -d "$zc/plugins/$n" ] && { skip "plugin $n"; continue; }
+        git_clone_fixo "https://github.com/$repo" "$tag" "$commit" "$zc/plugins/$n" || warn "plugin $n nao instalou"
     done
     [ "$(getent passwd "$USER" | cut -d: -f7)" = "$(command -v zsh)" ] || { sudo chsh -s "$(command -v zsh)" "$USER" && info "shell padrao: zsh (vale no proximo login)"; }
     [ -f "$HOME/.fzf.zsh" ] || true
