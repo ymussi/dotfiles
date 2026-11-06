@@ -76,7 +76,7 @@ O destino não pode estar num repo git nem no HOME: o arquivo leva segredos.
 `tailscale` → `vpn` (openvpn3) → `apps` (Chrome, VS Code, Firefox, Telegram, Slack, Spotify, Postman, btop, DBeaver, TeamViewer) →
 `displaylink` → `zram` (50% da RAM, metade em cada dispositivo, mais `99-zram.conf`) → `energia` (nunca suspende: tampa, ocioso e sleep mascarado; Wi-Fi sem powersave; perfil performance; driver de vídeo Intel só se houver GPU Intel) → `playwright` → `shell` (zsh + oh-my-zsh) → `pacotes` (reinstala as listas do backup: apt, snap, npm -g,
 extensões do VS Code e do Kiro, pip, uv, pipx, gh, dconf, cron) → `projetos` (clona os repos que não estavam no tar) → `git-integridade` →
-`harness` (clona `dotfiles-claude`, roda o `install.sh`, liga linger e as units que estavam ligadas) → `efi-windows` (só com `--limpa-efi-windows`).
+`harness` (clona `dotfiles-claude`, só na branch `main` e sem commit local fora do remoto roda o `install.sh` e liga o linger; não liga unit nenhuma por conta própria: as que estavam ligadas na origem e o `install.sh` deixa desligadas são listadas no fim, para ligar numa máquina só). O estado de guardrail do harness (`~/.claude/change-*`: aprovações registradas e a chave do bypass) não migra: o restore e o delta não o extraem → `efi-windows` (só com `--limpa-efi-windows`).
 
 Cada etapa confere o estado antes de agir; rodar de novo só refaz o que falta. Repos de terceiros sem a suite do Ubuntu novo caem para a primeira que existir entre `resolute`, `questing` e `noble` (a checagem segue redirect e recusa página de erro). Pacote do apt que não existe no release é pulado com aviso, e se a instalação em lote falhar o script tenta um a um.
 

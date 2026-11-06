@@ -66,6 +66,7 @@ HARNESS_REPO_SSH="${HARNESS_REPO_SSH:-git@github.com:ymussi/dotfiles-claude.git}
 RESTORE_DIR="$HOME/.local/share/backup-ubuntu-restore"
 INV="$RESTORE_DIR/inventario"
 HARNESS_DIR="${HARNESS_DIR:-$HOME/projects/dotfiles-claude}"
+HARNESS_BRANCH="${HARNESS_BRANCH:-main}"
 META=".backup-ubuntu-meta"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -83,6 +84,7 @@ RESTORE_ARG=""; AUTO_RESTORE=false; SEM_PROJ=false; IGNORA_SHA=false
 REFAZ_RESTORE=false; DELTA_ARG=""; LIMPA_EFI=false
 declare -A PULAR=() SO=()
 FALHAS=()
+NOTAS_FIM=()
 
 uso() { sed -n '3,/^#====.*$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
@@ -736,6 +738,11 @@ restaura_projetos() {
     info "$n repositorios clonados"
 }
 
+# Estado de guardrail do harness (as aprovacoes de mudanca registradas e a chave do bypass da trava, em
+# ~/.claude/change-*) vale so na maquina onde foi criado: nao migra no restore nem no delta.
+RESTORE_NAO_MIGRA=('.claude/change-*')
+tar_nao_migra() { local p; for p in "${RESTORE_NAO_MIGRA[@]}"; do printf -- '--exclude=%s\n--exclude=./%s\n' "$p" "$p"; done; }
+
 # Permissao certa em tudo que e segredo (o tar de usuario comum aplica umask, entao fecha de novo)
 fecha_permissoes() {
     local p
@@ -837,10 +844,11 @@ etapa_restore() {
     [ -t 0 ] || { erro "preciso de um terminal para pedir a senha."; return 1; }
     local PASS; IFS= read -rs -p "Senha do backup: " PASS; echo
     info "extraindo para $HOME (arquivos que ja existem NAO sao sobrescritos; os pulados sao listados)..."
-    local rc tarerr; tarerr="$(mktemp)"
+    local rc tarerr excl=(); tarerr="$(mktemp)"
+    mapfile -t excl < <(tar_nao_migra)
     set +e
     gpg --batch --pinentry-mode loopback --passphrase-fd 3 -d "$arq" 3< <(printf '%s' "$PASS") 2>/dev/null \
-        | tar -x --keep-old-files --no-same-owner -C "$HOME" 2>"$tarerr"
+        | tar -x --keep-old-files --no-same-owner --anchored "${excl[@]}" -C "$HOME" 2>"$tarerr"
     rc=("${PIPESTATUS[@]}")
     PASS=""
     # --keep-old-files avisa "Cannot open: File exists" por arquivo pulado e segue; qualquer outro erro e falha.
@@ -927,9 +935,10 @@ etapa_delta() {
     [ -t 0 ] || { erro "preciso de um terminal para pedir a senha do delta."; return 1; }
     local PASS; IFS= read -rs -p "Senha do pacote delta: " PASS; echo
     info "extraindo o delta em $HOME (sobrescreve; diretorios existentes mantem permissao)..."
-    local rc tarerr; tarerr="$(mktemp)"
+    local rc tarerr excl=(); tarerr="$(mktemp)"
+    mapfile -t excl < <(tar_nao_migra)
     gpg --batch --pinentry-mode loopback --passphrase-fd 3 -d "$arq" 3< <(printf '%s' "$PASS") 2>/dev/null \
-        | tar -x --no-same-owner --no-overwrite-dir -C "$HOME" 2>"$tarerr"
+        | tar -x --no-same-owner --no-overwrite-dir --anchored "${excl[@]}" -C "$HOME" 2>"$tarerr"
     rc=("${PIPESTATUS[@]}")
     PASS=""
     if [ "${rc[0]}" -ne 0 ] || [ "${rc[1]}" -ne 0 ]; then
@@ -1064,6 +1073,20 @@ etapa_git_integridade() {
 #     com sha256 fixo e cria as venvs da voz/Jarvis com hash), libs de audio (portaudio, sndfile, espeak-ng, ffmpeg)
 #     e, ja restaurados do backup: ~/.zsh_secrets, ~/.claude, ~/.kiro, ~/.local/share/jarvis, ~/.local/share/voz.
 #==============================================================================
+# Lista as units do usuario que estavam ligadas na origem (inventario do backup) e estao desligadas aqui.
+harness_units_desligadas() {
+    local lista="$INV/systemd-user-enabled.txt" u n=0
+    [ -s "$lista" ] || return 0
+    while read -r u _; do
+        case "$u" in snap.*|gnome*|gcr*|gpg*|dirmngr*|keyboxd*|org.*|pipewire*|wireplumber*|obex*|mpris*|xdg*|spice*|upgrade*|user-session*|ubuntu*|filter-chain*|openvpn3*|dbus*|"") continue ;; esac
+        [ -e "$HOME/.config/systemd/user/$u" ] || continue
+        systemctl --user is-enabled --quiet "$u" 2>/dev/null && continue
+        [ $n -eq 0 ] && warn "ligadas na maquina de origem e DESLIGADAS aqui (opt-in; ligue numa maquina so):"
+        printf '    systemctl --user enable --now %s\n' "$u" >&2; n=$((n+1))
+    done < "$lista"
+    [ $n -eq 0 ] || NOTAS_FIM+=("$n unit(s) do usuario ligadas na origem ficaram desligadas: a lista esta na etapa harness")
+    return 0
+}
 etapa_harness() {
     export PATH="$HOME/.local/bin:$PATH"
     local c falta=""
@@ -1082,27 +1105,30 @@ etapa_harness() {
         fi
     else
         skip "harness ja clonado em $HARNESS_DIR"
-        TMO 120 git -C "$HARNESS_DIR" pull --ff-only 2>/dev/null || warn "git pull do harness nao avancou (mudanca local ou sem rede); sigo com o que ha."
     fi
-    # linger: os servicos do usuario (claude-remote, jarvis) sobem no boot sem login grafico
+    # O install.sh linka a trava de mudanca e os hooks a partir deste checkout: so roda na branch principal,
+    # sem commit local fora do remoto.
+    local br; br="$(git -C "$HARNESS_DIR" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+    if [ "$br" != "$HARNESS_BRANCH" ]; then
+        erro "harness em '${br:-HEAD solto}', nao em $HARNESS_BRANCH: install.sh NAO rodado. Rode 'git -C $HARNESS_DIR switch $HARNESS_BRANCH' e repita com --so harness."
+        return 1
+    fi
+    TMO 120 git -C "$HARNESS_DIR" pull --ff-only </dev/null >/dev/null 2>&1 || warn "git pull do harness nao avancou (mudanca local ou sem rede)."
+    local fora; fora="$(git -C "$HARNESS_DIR" rev-list --count "origin/$HARNESS_BRANCH..HEAD" 2>/dev/null || echo '?')"
+    if [ "$fora" != 0 ]; then
+        erro "o $HARNESS_BRANCH local do harness tem commit fora do origin/$HARNESS_BRANCH ($fora): install.sh NAO rodado."
+        return 1
+    fi
+    [ -z "$(git -C "$HARNESS_DIR" status --porcelain --untracked-files=no 2>/dev/null)" ] \
+        || warn "harness com arquivo versionado alterado localmente; o install.sh linka a versao do disco."
+    # linger: os servicos do usuario sobem no boot sem login grafico
     loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes' || sudo loginctl enable-linger "$USER"
-    # O install.sh linka config, binarios, units systemd --user, venvs da voz (uv, python 3.12 fixo) e liga os timers essenciais
+    # O install.sh linka config, binarios e units systemd --user, cria as venvs e liga o que e padrao dele
     ( cd "$HARNESS_DIR" && TMO 1800 ./install.sh ) || { erro "install.sh do harness falhou"; return 1; }
     systemctl --user daemon-reload 2>/dev/null || true
-    # Liga o que estava ligado na maquina de origem (lista do backup); sem lista, os tres servicos base
-    local u lista="$INV/systemd-user-enabled.txt" unidades=""
-    if [ -s "$lista" ]; then
-        unidades="$(awk '{print $1}' "$lista" | grep -Ev '^(snap\.|gnome|gcr|gpg|dirmngr|keyboxd|org\.|pipewire|wireplumber|obex|mpris|xdg|spice|upgrade|user-session|ubuntu|filter-chain|openvpn3|dbus)' || true)"
-    fi
-    [ -n "$unidades" ] || unidades="claude-remote.service jarvis.service escritorio-local.service"
-    for u in $unidades; do
-        [ -e "$HOME/.config/systemd/user/$u" ] || continue
-        systemctl --user is-enabled --quiet "$u" 2>/dev/null || systemctl --user enable "$u" 2>/dev/null || warn "nao habilitei $u"
-    done
-    # jarvis e escritorio-local sobem agora; o claude-remote so no proximo boot (subir agora abriria uma segunda sessao do Head)
-    for u in jarvis.service escritorio-local.service; do
-        [ -e "$HOME/.config/systemd/user/$u" ] && { systemctl --user is-active --quiet "$u" || systemctl --user start "$u" 2>/dev/null || warn "$u nao subiu (veja journalctl --user -u $u)"; }
-    done
+    # Nao religa nada por conta propria: o que estava ligado na maquina de origem e o install.sh deixou
+    # desligado e opt-in (rotinas que gastam credito, sessoes remotas). Ligar nas duas maquinas duplica custo.
+    harness_units_desligadas
     tem tailscale && warn "Jarvis fica exposto por 'tailscale serve': depois do 'sudo tailscale up', refaca o serve (veja o README do dotfiles-claude)."
     warn "Logins que o backup nao resolve: 'gh auth login' (se o token expirou), 'aws sso login', 'kiro-cli login', 'claude' (login), 'gemini' (login), 'sudo tailscale up'."
     return 0
@@ -1209,6 +1235,10 @@ executa_etapa efi-windows etapa_efi_windows
 confere_vpn_nm
 
 echo
+if [ ${#NOTAS_FIM[@]} -gt 0 ]; then
+    warn "Ficou de fora de proposito:"
+    printf '    - %s\n' "${NOTAS_FIM[@]}"
+fi
 if [ ${#FALHAS[@]} -eq 0 ]; then
     info "Setup concluido sem falhas. Faca logout/login (grupo docker, shell zsh) e reinicie para o claude-remote subir no boot."
 else

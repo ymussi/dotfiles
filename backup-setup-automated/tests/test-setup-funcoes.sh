@@ -289,6 +289,76 @@ else
     pula "/etc com terminal (falta script)"
 fi
 
+# restore principal de ponta a ponta, com terminal e gpg real: backup de mentira montado aqui
+if command -v script >/dev/null 2>&1 && command -v gpg >/dev/null 2>&1; then
+    REAL_GPG="$(command -v gpg)"; mkdir -p "$T/real"
+    printf '#!/bin/sh\nexec %s "$@"\n' "$REAL_GPG" > "$T/real/gpg"; chmod +x "$T/real/gpg"
+    ( export GNUPGHOME="$T/gnupg-bk"; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+      S="$T/bk-src"; M="$S/.backup-ubuntu-meta"
+      mkdir -p "$M/inventario" "$M/raiz/etc/sysctl.d" "$S/docs" "$S/.claude/change-aprovacoes-teste" "$S/.claude/jobs"
+      echo /home/velho > "$M/inventario/home-origem.txt"
+      echo 'vm.x = 1' > "$M/raiz/etc/sysctl.d/90-x.conf"
+      echo 'do backup' > "$S/.zshrc"; echo novo > "$S/docs/novo.txt"; echo job > "$S/.claude/jobs/j.txt"
+      echo '{"aprovado": true}' > "$S/.claude/change-aprovacoes-teste/a.json"
+      mkdir -p "$T/bk/backup-ubuntu-teste"
+      tar -C "$S" -cf - .backup-ubuntu-meta .zshrc docs .claude \
+          | "$REAL_GPG" --batch --yes --pinentry-mode loopback --passphrase-fd 3 --symmetric -o "$T/bk/backup-ubuntu-teste/backup.tar.gpg" 3< <(printf '%s' 'senha-de-teste') 2>/dev/null
+      ( cd "$T/bk/backup-ubuntu-teste" && sha256sum backup.tar.gpg > SHA256SUMS ) )
+    cat > "$T/pty-restore.sh" <<EOF
+#!/usr/bin/env bash
+set --
+export PATH="$T/real:$BINR:$BIN:\$PATH" HOME="$T/home-rst" SETUP_SO_FUNCOES=1 GNUPGHOME="$T/gnupg-rst"
+export LANG="\${LANG_TESTE:-C.UTF-8}" LC_ALL="\${LANG_TESTE:-}"
+mkdir -p "\$HOME" "\$GNUPGHOME"; chmod 700 "\$GNUPGHOME"
+echo 'meu' > "\$HOME/.zshrc"
+source "$SETUP" >/dev/null 2>&1
+ETC_DEST="$T/etcdest-rst"; ETC_STAGE_BASE="$T/rootstage-rst"; mkdir -p "\$ETC_DEST" "\$ETC_STAGE_BASE"
+RESTORE_ARG="$T/bk/backup-ubuntu-teste"
+etapa_restore; echo "RC=\$?"
+EOF
+    restore_pty() { rm -rf "$T/home-rst" "$T/etcdest-rst" "$T/rootstage-rst"
+        (sleep 2; printf '%s\n' "$1") | timeout 120 script -qec "bash $T/pty-restore.sh" /dev/null > "$T/o" 2>&1; }
+    echo "== restore principal com terminal (gpg real, HOME temporario)"
+    restore_pty senha-de-teste
+    H="$T/home-rst"
+    chk "senha certa: rc 0, extrai, grava a marca e apaga o meta" "$T/o" bash -c "grep -q 'RC=0' '$T/o' && [ -f '$H/docs/novo.txt' ] && [ -f '$H/.local/share/backup-ubuntu-restore/restore-concluido' ] && [ ! -e '$H/.backup-ubuntu-meta' ]"
+    chk "estado de guardrail (~/.claude/change-*) nao migra; o resto do ~/.claude vem" "$T/o" bash -c "[ ! -e '$H/.claude/change-aprovacoes-teste' ] && [ -f '$H/.claude/jobs/j.txt' ]"
+else
+    pula "restore principal com terminal (falta script ou gpg)"
+fi
+
+echo "== harness: branch principal e units opt-in"
+(
+    prologo harness
+    cat > "$BIN/systemctl" <<EOF
+#!/bin/sh
+echo "\$*" >> "$T/systemctl.calls"
+case "\$*" in *is-enabled*) exit 1 ;; esac
+exit 0
+EOF
+    printf '#!/bin/sh\necho Linger=yes\n' > "$BIN/loginctl"; chmod +x "$BIN/systemctl" "$BIN/loginctl"
+    git init -q --bare -b main "$T/harness-origem.git"
+    git clone -q "$T/harness-origem.git" "$T/harness" 2>/dev/null
+    ( cd "$T/harness" && printf '#!/bin/sh\necho rodou > "%s"\n' "$T/install.marca" > install.sh && chmod +x install.sh \
+        && git add install.sh && git -c user.name=t -c user.email=t@t commit -q -m i && git push -q origin main 2>/dev/null )
+    HARNESS_DIR="$T/harness"; INV="$T/inv-harness"; mkdir -p "$INV" "$HOME/.config/systemd/user"
+    printf 'rotina-cara.timer enabled enabled\ngnome-x.service enabled enabled\n' > "$INV/systemd-user-enabled.txt"
+    : > "$HOME/.config/systemd/user/rotina-cara.timer"
+    git -C "$T/harness" switch -q -c feature
+    rm -f "$T/install.marca"; : > "$T/systemctl.calls"
+    etapa_harness > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "fora da main: rc 1 e install.sh nao roda" "$T/o" bash -c "[ $rc -eq 1 ] && grep -q 'install.sh NAO rodado' '$T/o' && [ ! -e '$T/install.marca' ]"
+    git -C "$T/harness" switch -q main
+    ( cd "$T/harness" && echo x > y && git add y && git -c user.name=t -c user.email=t@t commit -q -m local )
+    etapa_harness > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "main com commit local fora do remoto: rc 1 e install.sh nao roda" "$T/o" bash -c "[ $rc -eq 1 ] && grep -q 'commit fora do origin' '$T/o' && [ ! -e '$T/install.marca' ]"
+    git -C "$T/harness" reset -q --hard origin/main
+    : > "$T/systemctl.calls"
+    etapa_harness > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "main igual ao remoto: install.sh roda" "$T/o" bash -c "[ $rc -eq 0 ] && [ -f '$T/install.marca' ]"
+    chk "nao liga unit nenhuma; lista a opt-in que estava ligada na origem" "$T/o" bash -c "! grep -qE '(^| )(enable|start)( |$)' '$T/systemctl.calls' && grep -q 'enable --now rotina-cara.timer' '$T/o' && ! grep -q gnome-x '$T/o'"
+)
+
 echo "== perfis de VPN do NetworkManager"
 (
     prologo vpn
