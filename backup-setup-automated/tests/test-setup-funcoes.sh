@@ -412,6 +412,27 @@ echo "== downloads com versao e sha256 fixos"
     chk "baixa sem sha256 so no kubectl (sha256 do proprio dl.k8s.io), Kiro IDE e TeamViewer" "$T/o" test ! -s "$T/o"
 )
 
+echo "== configuracao local fora do repo (repo publico)"
+(
+    prologo conf
+    SETUP_CONF="$T/setup.conf"
+    printf '# comentario\nHARNESS_REPO = "https://github.com/dono/harness-x.git"\nSEGREDOS_EXTRA=.config/ferramenta .local/share/app ../fora\n' > "$SETUP_CONF"
+    v="$(conf HARNESS_REPO)"
+    [ "$v" = "https://github.com/dono/harness-x.git" ] && ok "conf le CHAVE=valor do arquivo e tira as aspas" || nok "conf le o arquivo (veio '$v')"
+    v="$(HARNESS_REPO=https://outro conf HARNESS_REPO)"
+    [ "$v" = "https://outro" ] && ok "variavel de ambiente vence o arquivo" || nok "variavel de ambiente vence (veio '$v')"
+    mkdir -p "$HOME/.config/ferramenta" "$HOME/.local/share/app"; echo s > "$HOME/.config/ferramenta/token"; chmod 644 "$HOME/.config/ferramenta/token"
+    fecha_permissoes > "$T/o" 2>&1
+    chk "SEGREDOS_EXTRA leva chmod go-rwx; caminho com .. e recusado" "$T/o" bash -c "[ \$(stat -c %a '$HOME/.config/ferramenta/token') = 600 ] && grep -q 'ignora ../fora' '$T/o'"
+    SETUP_CONF="$T/nao-existe.conf"; HARNESS_DIR=""
+    etapa_harness > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "sem configuracao: etapa harness pulada, rc 0, nada clonado" "$T/o" bash -c "[ $rc -eq 0 ] && grep -q 'sem HARNESS_REPO nem HARNESS_DIR' '$T/o'"
+    # o repo e publico: nenhum nome privado do harness nos scripts e no README
+    priv="$(printf '%s|' dotfiles-cl''aude jar''vis pol''ly nm-vpn slack_''secret zsh_''secrets claude-re''mote kiro-re''mote xo-''cli '/v''oz')"
+    grep -inE "${priv%|}" "$SETUP" "$AQUI/../backup.sh" "$AQUI/../README.md" > "$T/o"
+    chk "sem nome privado do harness nos scripts e no README" "$T/o" test ! -s "$T/o"
+)
+
 echo "== perfis de VPN do NetworkManager"
 (
     prologo vpn

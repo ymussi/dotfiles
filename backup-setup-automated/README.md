@@ -31,7 +31,7 @@ Duas coisas ficam de fora do padrão e o resumo do fim lembra como ligar:
   perfil performance). Sem a opção, a energia fica como o Ubuntu entrega.
 
 `./ubuntu-setup-automated.sh --help` lista as opções (`--pular`, `--so`, `--sem-harness`, `--ignorar-sha256`, `--refazer-restore`, `--delta`, `--limpa-efi-windows`...).
-Depois do setup: logout/login (grupo docker, shell zsh) e reboot (o `claude-remote` sobe no boot).
+Depois do setup: logout/login (grupo docker, shell zsh) e reboot (os serviços do usuário sobem no boot, com linger).
 Destino aceito: NTFS, exFAT, ext4. FAT32 é recusado (limite de 4 GB por arquivo).
 
 ## Lições do restore real (06/11/2026)
@@ -42,20 +42,20 @@ Destino aceito: NTFS, exFAT, ext4. FAT32 é recusado (limite de 4 GB por arquivo
 | Rodar o comando de novo decifrava e extraía 30 GB outra vez. | Restore concluído grava uma marca (`~/.local/share/backup-ubuntu-restore/restore-concluido`) e é pulado nas repetições. `--refazer-restore` força. |
 | O `.git/index` e um ref de um repo viraram o texto de um arquivo do `~/.claude/file-history` (o index era hardlink dele). | Etapa `git-integridade` (depois de `projetos`, antes de `harness`): separa hardlinks dentro de `.git`, roda `git status` e `git fsck --connectivity-only` em cada repo sob o HOME e lista os com problema (a etapa falha se houver). Só lê e reporta; o conserto do index ou do ref é manual (guarde como `.corrompido`, apague, `git fetch`, `git reset`). |
 | O pacote delta (o que mudou depois do backup) é um tar.gpg à parte. | `--delta ARQUIVO` (ou `--delta auto`, que procura `delta-pos-backup-*.tar.gpg` ao lado da pasta do backup) restaura **depois** do principal, pede a senha dele, sobrescreve (o delta é mais novo) e roda uma vez só (marca `delta-concluido`). Recusa se o restore principal falhou. |
-| A ESP de fábrica do Acer ficou com a entrada "Windows Boot Manager" e `EFI/Microsoft` sem Windows. | `--limpa-efi-windows` (nunca por padrão): confere que o Ubuntu tem entrada e loader próprios, avisa se há NTFS/BitLocker no mesmo disco, guarda uma cópia de `EFI/Microsoft` em `~/.local/share/backup-ubuntu-restore/`, e só remove (`efibootmgr -B` + a pasta) depois de digitar `APAGAR` no terminal. Sem terminal, não faz nada. |
-| Os perfis de VPN do NetworkManager não vieram. | Ficam em `/etc/NetworkManager/system-connections` (root): só entram no backup com sudo. No fim, o setup avisa se não há perfil `vpn`/`wireguard` no NetworkManager. O `install.sh` do harness (`harness/bin/nm-vpn-perfis`, repo privado `dotfiles-claude`) recria os perfis; certificados e chaves moram lá, não neste repo público. |
+| A ESP de fábrica do notebook ficou com a entrada "Windows Boot Manager" e `EFI/Microsoft` sem Windows. | `--limpa-efi-windows` (nunca por padrão): confere que o Ubuntu tem entrada e loader próprios, avisa se há NTFS/BitLocker no mesmo disco, guarda uma cópia de `EFI/Microsoft` em `~/.local/share/backup-ubuntu-restore/`, e só remove (`efibootmgr -B` + a pasta) depois de digitar `APAGAR` no terminal. Sem terminal, não faz nada. |
+| Os perfis de VPN do NetworkManager não vieram. | Ficam em `/etc/NetworkManager/system-connections` (root): só entram no backup com sudo. No fim, o setup avisa se não há perfil `vpn`/`wireguard` no NetworkManager e mostra como importar (`nmcli connection import`). |
 
 Testes: `timeout 300 ./tests/test-setup-funcoes.sh` carrega só as funções (`SETUP_SO_FUNCOES=1`), com HOME temporário e `sudo`, `snap`, `efibootmgr`, `nmcli` trocados por shims. Não roda o setup, não usa sudo real nem toca a ESP.
 
 ## O que o backup leva
 
 **O HOME inteiro**, menos uma lista de exclusão. Entra tudo: segredos e logins (`~/.ssh`, `~/.aws`, `~/.kube`, `~/.gnupg`,
-keyrings, tokens), harness e Jarvis, configs, documentos, `~/projects` inteiro (pastas sem git, arquivos ignorados, stash),
+keyrings, tokens), configs, documentos, `~/projects` inteiro (pastas sem git, arquivos ignorados, stash),
 perfis de navegador, o que mais houver.
 
 **Fica de fora** (e o fim da execução imprime a seção "FORA DO BACKUP", com tamanho de cada item):
 `~/Downloads`, `~/.cache`, lixeira, `**/node_modules`, `**/.terraform` (o `.terraform.lock.hcl` fica), `**/.venv`, `**/venv`,
-`**/__pycache__`, `~/.npm`, `~/.cargo/registry`, `~/snap/*/common/.cache`, venvs da voz, caches do Chrome e do Firefox,
+`**/__pycache__`, `~/.npm`, `~/.cargo/registry`, `~/snap/*/common/.cache`, caches do Chrome e do Firefox,
 containers e docker do usuário, o cache de SSO da AWS e o plugin-cache do terraform.
 Exclusões só desta máquina (um caminho relativo ao HOME por linha) ficam em `~/.config/backup-ubuntu-excluir.txt`
 (ou em `BACKUP_EXCLUIR_FILE`, ou `--excluir CAMINHO`), fora do repo.
@@ -79,11 +79,11 @@ O destino não pode estar num repo git nem no HOME: o arquivo leva segredos.
 
 `apt` (base + extras de uso) → `restore` (devolve o backup: segredos e logins vêm antes de tudo) → `delta` (só com `--delta`) → `docker` → `node` (nvm + NodeSource) →
 `uv` (+ Python 3.12) → `gh` → `aws` (CLI v2, session-manager-plugin, aws_signing_helper) → `terraform` → `kubectl` (helm, k9s, argocd) →
-`cli-extra` (stern, lazygit, trivy, actionlint, kubectx) → `kiro` (CLI **e IDE**) → `claude` → `cli-ia` (Gemini CLI, xo-cli) → `rclone` →
+`cli-extra` (stern, lazygit, trivy, actionlint, kubectx) → `kiro` (CLI **e IDE**) → `claude` → `cli-ia` (CLIs do npm global: `NPM_GLOBAL`, padrão Gemini CLI) → `rclone` →
 `tailscale` → `vpn` (openvpn3) → `apps` (Chrome, VS Code, Firefox, Telegram, Slack, Spotify, Postman, btop, DBeaver; TeamViewer só com `--acesso-remoto`) →
 `displaylink` → `zram` (50% da RAM, metade em cada dispositivo, mais `99-zram.conf`) → `energia` (driver de vídeo Intel só se houver GPU Intel; com `--sem-suspender`, nunca suspende: tampa, ocioso e sleep mascarado, Wi-Fi sem powersave, perfil performance) → `playwright` → `shell` (zsh + oh-my-zsh) → `pacotes` (reinstala as listas do backup: apt, snap, npm -g,
 extensões do VS Code e do Kiro, pip, uv, pipx, gh, dconf, cron) → `projetos` (clona os repos que não estavam no tar) → `git-integridade` →
-`harness` (clona `dotfiles-claude`, só na branch `main` e sem commit local fora do remoto roda o `install.sh` e liga o linger; não liga unit nenhuma por conta própria: as que estavam ligadas na origem e o `install.sh` deixa desligadas são listadas no fim, para ligar numa máquina só). O estado de guardrail do harness (`~/.claude/change-*`: aprovações registradas e a chave do bypass) não migra: o restore e o delta não o extraem → `efi-windows` (só com `--limpa-efi-windows`).
+`harness` (opcional, só com `HARNESS_REPO`/`HARNESS_DIR` configurados: clona o repositório, só na branch `main` e sem commit local fora do remoto roda o `install.sh` e liga o linger; não liga unit nenhuma por conta própria: as que estavam ligadas na origem e o `install.sh` deixa desligadas são listadas no fim, para ligar numa máquina só). O estado de guardrail do harness (`~/.claude/change-*`: aprovações registradas e a chave do bypass) não migra: o restore e o delta não o extraem → `efi-windows` (só com `--limpa-efi-windows`).
 
 O que é baixado e executado fora do apt tem versão e sha256 fixos no script (variáveis `*_V` e `*_SHA` no topo):
 AWS CLI, `aws_signing_helper`, `session-manager-plugin`, nvm, uv, helm, k9s, argocd, stern, lazygit, trivy, actionlint, rclone,
@@ -96,18 +96,30 @@ Cada etapa confere o estado antes de agir; rodar de novo só refaz o que falta. 
 
 Conferido em 05/11/2026 contra o índice `stonking` do archive: Docker e Tailscale têm suite própria; HashiCorp e OpenVPN3 ainda não (HashiCorp cai para `resolute`, OpenVPN3 para `resolute`); gh, Chrome, VS Code, NodeSource e DisplayLink usam suite fixa (`stable`/`nodistro`), sem depender do release.
 
-### Pré-requisitos do harness (`dotfiles-claude`, privado)
+### Configuração local (fora do repo)
 
-`git`, `gh` **logado** (o login vem do backup; senão `gh auth login`), `tmux`, `jq`, `python3` do sistema, Node do sistema, `curl`, `unzip`,
-`kiro-cli` e `claude` em `~/.local/bin`, systemd `--user` com linger, libs de áudio (portaudio, sndfile, espeak-ng, ffmpeg). O `install.sh`
-do harness instala o `uv` com sha256 fixo e cria as venvs da voz/Jarvis (Python 3.12, pacotes com hash).
+O que é desta máquina e não é genérico (repositório de harness, caminhos de segredo de ferramentas próprias, CLIs extras)
+fica em `~/.config/backup-ubuntu-setup.conf` (ou `SETUP_CONF`), uma linha `CHAVE=valor` por item, lida e nunca executada.
+Variável de ambiente com o mesmo nome vence. Como fica em `~/.config`, vai no backup e já está lá quando o restore termina.
+Sem o arquivo, o setup faz só o genérico e pula a etapa `harness`.
+
+```ini
+HARNESS_REPO=https://github.com/<dono>/<repo-do-harness>.git
+# HARNESS_DIR=~/projects/<repo-do-harness>   (padrão)
+# HARNESS_BRANCH=main                        (padrão)
+SEGREDOS_EXTRA=.config/<ferramenta> .local/share/<app>
+NPM_GLOBAL=@google/gemini-cli <outro-cli>
+AVISO_FIM=lembrete impresso no fim do setup
+```
+
+O harness precisa, além do que o setup instala, de `gh` logado ou chave SSH (vêm no restore) e do que o `install.sh` dele pedir.
 
 ### Fica manual
 
 Logins que o backup não garante: `gh auth login` (se o token expirou), `aws sso login`, `kiro-cli login`, `claude`, `gemini`,
-`sudo tailscale up` (e refazer o `tailscale serve` do Jarvis), chave MOK do DKMS com Secure Boot. NoMachine e GitKraken CLI: baixar à mão.
+`sudo tailscale up`, chave MOK do DKMS com Secure Boot. NoMachine e GitKraken CLI: baixar à mão.
 
 ## Não vai para o repo
 
-Nenhum segredo, e-mail, hostname interno, IP ou dado pessoal. A identidade do git vem do `~/.gitconfig` do backup ou das
+Nenhum segredo, e-mail, hostname interno, IP, dado pessoal nem nome de repositório privado: isso vai na configuração local acima. A identidade do git vem do `~/.gitconfig` do backup ou das
 variáveis `GIT_USER_NAME`/`GIT_USER_EMAIL`.

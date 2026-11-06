@@ -161,12 +161,10 @@ EXCL_ANC=(
     '.aws/sso/cache' '.aws/cli/cache' '.terraform.d/plugin-cache'
     '.kiro/crew-venv' '.kiro/.crew-venv-*' '.kiro/crew-python' '.kiro/extensions' '.kiro/logs'
     '.claude/cache' '.claude/shell-snapshots' '.claude/statsig' '.claude/telemetry'
-    '.local/share/jarvis/venv' '.local/share/jarvis/venv.bak*'
-    '.local/share/voz/venv*' '.local/share/voz/*/venv*'
 )
 # Em qualquer profundidade
 EXCL_ANY=(
-    'node_modules' '.terraform' '.venv' 'venv' '__pycache__' '.pytest_cache' '.mypy_cache' '*.pyc'
+    'node_modules' '.terraform' '.venv' 'venv' 'venv.bak*' '__pycache__' '.pytest_cache' '.mypy_cache' '*.pyc'
     '.config/google-chrome/*/Cache' '.config/google-chrome/*/Code Cache'
     '.config/google-chrome/*/Service Worker/CacheStorage'
     '.mozilla/*/cache2'

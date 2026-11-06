@@ -24,7 +24,7 @@
 #                       Wi-Fi sem economia de energia e perfil de energia performance. Sem esta opcao,
 #                       a energia fica como o Ubuntu entrega.
 #   --auto-restore      procura backup-ubuntu-* em /media/$USER/* e usa o mais novo.
-#   --sem-harness       nao clona o dotfiles-claude nem roda o install.sh dele.
+#   --sem-harness       nao clona o repositorio de harness nem roda o install.sh dele.
 #   --sem-displaylink   pula o driver DisplayLink (dock USB).
 #   --sem-projetos      no restore, nao re-clona os repos de ~/projects.
 #   --pular ETAPA       pula uma etapa (repetivel). Nomes: apt restore docker node uv gh aws
@@ -34,6 +34,17 @@
 #   --so ETAPA          roda so a etapa (repetivel; "restore" tambem vale).
 #   --listar            lista as etapas e sai.
 #   -h, --help
+#
+# Configuracao local (fora do repo): ~/.config/backup-ubuntu-setup.conf (ou SETUP_CONF), linhas CHAVE=valor,
+# lidas e nunca executadas; variavel de ambiente com o mesmo nome vence. Como fica em ~/.config, vai junto no
+# backup e ja esta la quando o restore termina. Chaves:
+#   HARNESS_REPO       URL do repositorio de harness a clonar (sem ela, e sem HARNESS_DIR, a etapa harness e pulada)
+#   HARNESS_REPO_SSH   URL SSH do mesmo repo (padrao: derivada da HARNESS_REPO quando e github.com)
+#   HARNESS_DIR        onde fica o checkout (padrao: ~/projects/<nome do repo>)
+#   HARNESS_BRANCH     branch exigida antes do install.sh (padrao: main)
+#   SEGREDOS_EXTRA     caminhos relativos ao HOME, separados por espaco, que tambem levam chmod go-rwx no restore
+#   NPM_GLOBAL         CLIs do npm global da etapa cli-ia (padrao: @google/gemini-cli)
+#   AVISO_FIM          texto livre impresso no fim do setup (lembrete da maquina)
 #
 # Variaveis opcionais: GIT_USER_NAME, GIT_USER_EMAIL (so usadas se o backup nao
 # trouxe o ~/.gitconfig), ZRAM_ALGO_0/ZRAM_ALGO_1, ZRAM_MB_0/ZRAM_MB_1
@@ -66,8 +77,7 @@ RAM_MB="$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)"; 
 RAM_MB=$(( (RAM_MB + 2047) / 2048 * 2048 ))
 ZRAM_MB_0="${ZRAM_MB_0:-$((RAM_MB / 4))}"; ZRAM_ALGO_0="${ZRAM_ALGO_0:-lzo-rle}"
 ZRAM_MB_1="${ZRAM_MB_1:-$((RAM_MB / 4))}"; ZRAM_ALGO_1="${ZRAM_ALGO_1:-zstd}"
-HARNESS_REPO="${HARNESS_REPO:-https://github.com/ymussi/dotfiles-claude.git}"
-HARNESS_REPO_SSH="${HARNESS_REPO_SSH:-git@github.com:ymussi/dotfiles-claude.git}"
+SETUP_CONF="${SETUP_CONF:-$HOME/.config/backup-ubuntu-setup.conf}"
 # Versao fixa e sha256 de tudo que e baixado e executado fora do apt. Conferidos em 06/11/2026: os hashes vem do
 # arquivo de checksums publicado no proprio release (k9s, stern, lazygit, trivy, actionlint, argocd, helm, uv, rclone)
 # ou do download, quando o fornecedor nao publica (aws cli, aws_signing_helper, session-manager-plugin, nvm,
@@ -104,8 +114,8 @@ ZSH_PLUGINS=("zsh-users/zsh-syntax-highlighting 0.8.0 db085e4661f6aafd24e5acb5b2
 SYNAPTICS_KEYRING_SHA=f83300928848f2f7605ff8438467267019c7cc5181ec8b9eabc7f1e05cbfacbe
 RESTORE_DIR="$HOME/.local/share/backup-ubuntu-restore"
 INV="$RESTORE_DIR/inventario"
-HARNESS_DIR="${HARNESS_DIR:-$HOME/projects/dotfiles-claude}"
-HARNESS_BRANCH="${HARNESS_BRANCH:-main}"
+HARNESS_DIR="${HARNESS_DIR:-}"
+HARNESS_BRANCH="${HARNESS_BRANCH:-}"
 META=".backup-ubuntu-meta"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -186,6 +196,15 @@ grava_root() {
 }
 
 tem() { command -v "$1" >/dev/null 2>&1; }
+# conf CHAVE: a variavel de ambiente/shell CHAVE; sem ela, a ultima linha CHAVE=valor do SETUP_CONF (lida, nunca executada).
+conf() {
+    local k="$1" v="${!1:-}"
+    if [ -z "$v" ] && [ -f "$SETUP_CONF" ]; then
+        v="$(sed -n "s/^[[:space:]]*$k[[:space:]]*=[[:space:]]*//p" "$SETUP_CONF" | tail -1 \
+            | sed -E -e 's/[[:space:]]+$//' -e "s/^([\"'])(.*)\\1\$/\\2/")"
+    fi
+    printf '%s' "$v"
+}
 pkg_instalado() { dpkg -s "$1" >/dev/null 2>&1; }
 apt_i() { sudo apt-get install -y --no-install-recommends "$@"; }
 # Nome do pacote no repo atual: o proprio, ou o unico provedor se for pacote virtual (ex.: dnsutils -> bind9-dnsutils).
@@ -351,7 +370,7 @@ etapa_node() {
 }
 
 #==============================================================================
-# 4. uv + Python 3.12 do uv (as venvs do Jarvis nao usam o Python 3.14 do sistema)
+# 4. uv + Python 3.12 do uv (para venvs que nao usam o Python do sistema)
 #==============================================================================
 etapa_uv() {
     if ! tem uv && [ ! -x "$HOME/.local/bin/uv" ]; then
@@ -363,7 +382,6 @@ etapa_uv() {
     else skip "uv"; fi
     export PATH="$HOME/.local/bin:$PATH"
     if ! uv python find "$PY_VERSAO" >/dev/null 2>&1; then TMO 600 uv python install "$PY_VERSAO" || return 1; else skip "python $PY_VERSAO (uv)"; fi
-    # As venvs exatas (versao e hashes fixos) sao criadas pelo install.sh do harness (voz-ambiente).
     return 0
 }
 
@@ -386,7 +404,7 @@ etapa_aws() {
         unzip -q "$d/aws.zip" -d "$d" && TMO 300 sudo "$d/aws/install" --update || return 1
         rm -rf "$d"
     fi
-    # IAM Roles Anywhere (voz do Jarvis na Polly): versao fixa, igual a desta maquina
+    # aws_signing_helper (credencial do IAM Roles Anywhere por certificado)
     if ! tem aws_signing_helper && [ ! -x "$HOME/.local/bin/aws_signing_helper" ]; then
         local sh_a=X86_64 d; [ "$ARCH" = arm64 ] && sh_a=Aarch64
         mkdir -p "$HOME/.local/bin"; d="$(tmpd)"
@@ -485,7 +503,7 @@ etapa_cli_extra() {
     return $rc
 }
 
-# snap com timeout: o snapd ja travou no download do spotify (restore de 06/11 no Acer, etapa apps parada ate
+# snap com timeout: o snapd ja travou no download do spotify (restore de 06/11, etapa apps parada ate
 # o timeout de 900 s). Passou de SNAP_TMO, aborta a mudanca pendente e segue, em vez de prender o setup.
 snap_aborta_pendentes() { # snap_aborta_pendentes nome
     local id
@@ -588,7 +606,8 @@ etapa_rclone() {
 }
 
 #==============================================================================
-# 7a. CLIs de IA e utilitarios que vivem no npm global (nvm): Gemini CLI, xo-cli
+# 7a. CLIs que vivem no npm global (nvm): NPM_GLOBAL da configuracao local (padrao: Gemini CLI).
+#     No restore, a etapa pacotes reinstala tambem a lista npm global do backup.
 #==============================================================================
 carrega_nvm() { export NVM_DIR="$HOME/.nvm"; # shellcheck disable=SC1091
     [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; tem npm; }
@@ -602,8 +621,9 @@ npm_garante() { # npm_garante pacote...
 }
 etapa_cli_ia() {
     carrega_nvm || { warn "npm ausente (etapa node)"; return 1; }
-    # xo-cli: nesta maquina e build do fonte em /opt/xo; aqui vem o pacote do npm (mesmo CLI, outro caminho)
-    npm_garante @google/gemini-cli xo-cli
+    local l; l="$(conf NPM_GLOBAL)"
+    # shellcheck disable=SC2086
+    npm_garante ${l:-@google/gemini-cli}
 }
 
 #==============================================================================
@@ -844,9 +864,11 @@ tar_nao_migra() { local p; for p in "${RESTORE_NAO_MIGRA[@]}"; do printf -- '--e
 # Permissao certa em tudo que e segredo (o tar de usuario comum aplica umask, entao fecha de novo)
 fecha_permissoes() {
     local p
-    for p in .ssh .aws .kube .gnupg .terraform.d .cert .docker .gemini .config/gh .config/rclone .config/gcloud \
-             .config/kiro-cli .config/teamviewer .config/xo-cli .local/share/keyrings .local/share/kiro-cli \
-             .local/share/jarvis .claude .kiro .zsh_secrets .claude.json .netrc .npmrc .slack_secret; do
+    local extra; extra="$(conf SEGREDOS_EXTRA)"
+    # shellcheck disable=SC2086
+    for p in .ssh .aws .kube .gnupg .terraform.d .docker .config/gh .config/rclone .config/gcloud \
+             .local/share/keyrings .netrc .npmrc $extra; do
+        case "$p" in /*|*..*) warn "SEGREDOS_EXTRA ignora $p (precisa ser relativo ao HOME)"; continue ;; esac
         [ -e "$HOME/$p" ] && chmod -R go-rwx "$HOME/$p" 2>/dev/null
     done
     [ -d "$HOME/.ssh" ] && { chmod 700 "$HOME/.ssh"; find "$HOME/.ssh" -type f -name '*.pub' -exec chmod 644 {} +; }
@@ -964,7 +986,7 @@ etapa_restore() {
     local meta="$HOME/$META"
     [ -d "$meta" ] || { erro "backup sem $META: nao foi gerado pelo backup.sh"; return 1; }
 
-    # Itens que eram symlink na origem (~/.zsh_secrets etc.) entram como arquivo real se ainda nao existem
+    # Itens que eram symlink na origem entram como arquivo real se ainda nao existem
     if [ -d "$meta/deref" ]; then
         ( cd "$meta/deref" && find . -type f -o -type l | sed 's#^\./##' ) | while IFS= read -r f; do
             [ -e "$HOME/$f" ] || [ -L "$HOME/$f" ] || { mkdir -p "$(dirname "$HOME/$f")"; cp -a "$meta/deref/$f" "$HOME/$f"; }
@@ -1125,7 +1147,7 @@ etapa_projetos() {
 
 #==============================================================================
 # 12d. Integridade dos repos git depois do restore
-#      No restore de 06/11 o .git/index e um ref do dotfiles-claude viraram o texto de um arquivo do
+#      No restore de 06/11 o .git/index e um ref de um repo viraram o texto de um arquivo do
 #      file-history do Claude (o index era hardlink dele no tar). Aqui: separa hardlinks dentro de .git
 #      (copia para inode proprio, para uma escrita no outro arquivo nao corromper o repo) e roda
 #      git status + fsck em cada repo. So le e reporta; nao apaga nada. Roda antes do harness porque
@@ -1165,12 +1187,9 @@ etapa_git_integridade() {
 }
 
 #==============================================================================
-# 13. Harness / Jarvis / segundo cerebro: clonar dotfiles-claude (privado), install.sh, servicos e linger
-#     Pre-requisitos (README e install.sh do dotfiles-claude): git, gh logado (o login vem do backup),
-#     tmux e jq, python3 do sistema (/usr/bin/python3), Node do sistema (servicos systemd), curl e unzip,
-#     kiro-cli e claude em ~/.local/bin, systemd --user + linger, uv e python 3.12 (o install.sh instala o uv
-#     com sha256 fixo e cria as venvs da voz/Jarvis com hash), libs de audio (portaudio, sndfile, espeak-ng, ffmpeg)
-#     e, ja restaurados do backup: ~/.zsh_secrets, ~/.claude, ~/.kiro, ~/.local/share/jarvis, ~/.local/share/voz.
+# 13. Harness (opcional): clona o repositorio configurado (HARNESS_REPO), roda o install.sh dele e liga o linger.
+#     Precisa de git e de acesso ao repo (gh logado ou chave SSH, que vem no restore). Sem HARNESS_REPO nem
+#     HARNESS_DIR, a etapa e pulada.
 #==============================================================================
 # Lista as units do usuario que estavam ligadas na origem (inventario do backup) e estao desligadas aqui.
 harness_units_desligadas() {
@@ -1188,18 +1207,26 @@ harness_units_desligadas() {
 }
 etapa_harness() {
     export PATH="$HOME/.local/bin:$PATH"
-    local c falta=""
-    for c in git gh tmux jq python3 curl unzip node systemctl kiro-cli claude; do tem "$c" || falta="$falta $c"; done
-    [ -z "$falta" ] || warn "pre-requisitos do harness ausentes:$falta (rode as etapas apt/node/gh/kiro/claude)."
+    local repo repo_ssh
+    repo="$(conf HARNESS_REPO)"; repo_ssh="$(conf HARNESS_REPO_SSH)"
+    HARNESS_DIR="$(conf HARNESS_DIR)"; HARNESS_BRANCH="$(conf HARNESS_BRANCH)"; HARNESS_BRANCH="${HARNESS_BRANCH:-main}"
+    [ -n "$HARNESS_DIR" ] || [ -z "$repo" ] || HARNESS_DIR="$HOME/projects/$(basename "$repo" .git)"
+    if [ -z "$HARNESS_DIR" ]; then
+        skip "harness: sem HARNESS_REPO nem HARNESS_DIR (variavel de ambiente ou $SETUP_CONF)"; return 0
+    fi
+    if [ -z "$repo_ssh" ]; then
+        case "$repo" in https://github.com/*) repo_ssh="git@github.com:${repo#https://github.com/}"; repo_ssh="${repo_ssh%.git}.git" ;; esac
+    fi
     if [ ! -d "$HARNESS_DIR/.git" ]; then
+        [ -n "$repo" ] || { erro "harness: $HARNESS_DIR nao e um checkout e falta HARNESS_REPO para clonar."; return 1; }
         mkdir -p "$(dirname "$HARNESS_DIR")"
         if tem gh && gh auth status >/dev/null 2>&1; then
             gh auth setup-git >/dev/null 2>&1
-            TMO 600 git clone "$HARNESS_REPO" "$HARNESS_DIR" </dev/null || return 1
-        elif ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | grep -qi 'successfully authenticated'; then
-            GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" TMO 600 git clone "$HARNESS_REPO_SSH" "$HARNESS_DIR" </dev/null || return 1
+            TMO 600 git clone "$repo" "$HARNESS_DIR" </dev/null || return 1
+        elif [ -n "$repo_ssh" ] && ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1 | grep -qi 'successfully authenticated'; then
+            GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" TMO 600 git clone "$repo_ssh" "$HARNESS_DIR" </dev/null || return 1
         else
-            erro "sem acesso ao GitHub (o repo do harness e privado). Restaure o backup (--restore, traz ~/.config/gh e ~/.ssh) ou rode 'gh auth login' e repita com --so harness."
+            erro "sem acesso ao repositorio do harness. Restaure o backup (--restore, traz ~/.config/gh e ~/.ssh) ou rode 'gh auth login' e repita com --so harness."
             return 1
         fi
     else
@@ -1228,8 +1255,6 @@ etapa_harness() {
     # Nao religa nada por conta propria: o que estava ligado na maquina de origem e o install.sh deixou
     # desligado e opt-in (rotinas que gastam credito, sessoes remotas). Ligar nas duas maquinas duplica custo.
     harness_units_desligadas
-    tem tailscale && warn "Jarvis fica exposto por 'tailscale serve': depois do 'sudo tailscale up', refaca o serve (veja o README do dotfiles-claude)."
-    warn "Logins que o backup nao resolve: 'gh auth login' (se o token expirou), 'aws sso login', 'kiro-cli login', 'claude' (login), 'gemini' (login), 'sudo tailscale up'."
     return 0
 }
 
@@ -1282,12 +1307,12 @@ etapa_efi_windows() {
 }
 
 # Perfis de VPN do NetworkManager: ficam em /etc/NetworkManager/system-connections (root) e so voltam do
-# backup se ele foi feito com sudo. No restore de 06/11 nao vieram; o install.sh do harness os recria.
+# backup se ele foi feito com sudo. No restore de 06/11 nao vieram.
 confere_vpn_nm() {
     tem nmcli || return 0
     [ ${#SO[@]} -eq 0 ] || return 0
     if ! TMO 20 nmcli -t -f TYPE connection show 2>/dev/null | grep -qxE 'vpn|wireguard'; then
-        warn "nenhum perfil de VPN (openvpn/wireguard) no NetworkManager. Se o backup nao os trouxe, o install.sh do harness (dotfiles-claude, harness/bin/nm-vpn-perfis) recria; sem harness, rode esse script a mao. Usuario e senha/MFA voce digita ao conectar."
+        warn "nenhum perfil de VPN (openvpn/wireguard) no NetworkManager. O backup so os leva com sudo (sem --sem-sudo); sem eles, recrie os perfis (nmcli connection import type openvpn file <arquivo.ovpn>). Usuario e senha/MFA voce digita ao conectar."
     fi
 }
 
@@ -1334,12 +1359,14 @@ executa_etapa efi-windows etapa_efi_windows
 confere_vpn_nm
 
 echo
+warn "Logins que o backup nao resolve: 'gh auth login' (se o token expirou), 'aws sso login', 'kiro-cli login', 'claude' (login), 'gemini' (login), 'sudo tailscale up'."
+AVISO_FIM="$(conf AVISO_FIM)"; [ -z "$AVISO_FIM" ] || warn "$AVISO_FIM"
 if [ ${#NOTAS_FIM[@]} -gt 0 ]; then
     warn "Ficou de fora de proposito:"
     printf '    - %s\n' "${NOTAS_FIM[@]}"
 fi
 if [ ${#FALHAS[@]} -eq 0 ]; then
-    info "Setup concluido sem falhas. Faca logout/login (grupo docker, shell zsh) e reinicie para o claude-remote subir no boot."
+    info "Setup concluido sem falhas. Faca logout/login (grupo docker, shell zsh) e reinicie para os servicos do usuario subirem no boot."
 else
     warn "Setup concluido com falhas em: ${FALHAS[*]}. Rode de novo (so refaz o que falta) ou use --so <etapa>."
     exit 1
