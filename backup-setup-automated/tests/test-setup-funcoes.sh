@@ -10,6 +10,9 @@
 #
 # Uso: timeout 300 ./tests/test-setup-funcoes.sh
 #==============================================================================
+# shellcheck disable=SC2034,SC2030,SC2031,SC2015,SC2329,SC2026,SC2012
+# (variaveis lidas pelas funcoes do setup carregadas por source; subshell por teste de proposito; chk/ok/nok em A && B || C;
+#  funcoes que substituem as do setup; nomes privados quebrados com '' para o proprio teste nao casar consigo)
 set -uo pipefail
 AQUI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETUP="$AQUI/../ubuntu-setup-automated.sh"
@@ -323,6 +326,25 @@ EOF
     H="$T/home-rst"
     chk "senha certa: rc 0, extrai, grava a marca e apaga o meta" "$T/o" bash -c "grep -q 'RC=0' '$T/o' && [ -f '$H/docs/novo.txt' ] && [ -f '$H/.local/share/backup-ubuntu-restore/restore-concluido' ] && [ ! -e '$H/.backup-ubuntu-meta' ]"
     chk "estado de guardrail (~/.claude/change-*) nao migra; o resto do ~/.claude vem" "$T/o" bash -c "[ ! -e '$H/.claude/change-aprovacoes-teste' ] && [ -f '$H/.claude/jobs/j.txt' ]"
+    chk "--keep-old-files: arquivo que ja existia fica e e listado como pulado" "$T/o" bash -c "grep -qx meu '$H/.zshrc' && grep -q 'ja existiam e NAO foram sobrescritos' '$T/o' && grep -q '~/.zshrc' '$T/o'"
+    # tar traduzido: este shim imita o tar em pt_BR (a maquina de teste nao tem a traducao) sempre que LC_ALL nao e C
+    REAL_TAR="$(command -v tar)"; mkdir -p "$T/tar-pt"
+    cat > "$T/tar-pt/tar" <<EOF
+#!/usr/bin/env bash
+[ "\${LC_ALL:-}" = C ] && exec "$REAL_TAR" "\$@"
+e="\$(mktemp)"; "$REAL_TAR" "\$@" 2>"\$e"; rc=\$?
+sed -e 's/Cannot open: File exists/Nao foi possivel abrir: Arquivo existe/' -e 's/Exiting with failure status due to previous errors/Saindo com status de falha devido a erros anteriores/' "\$e" >&2
+rm -f "\$e"; exit \$rc
+EOF
+    chmod +x "$T/tar-pt/tar"
+    sed -i "s#^export PATH=\"$T/real:#export PATH=\"\${PATH_EXTRA:-}$T/real:#" "$T/pty-restore.sh"
+    PATH_EXTRA="$T/tar-pt:" LANG_TESTE=pt_BR.UTF-8 restore_pty senha-de-teste
+    chk "tar em pt_BR: o restore roda o tar com LC_ALL=C e conclui (rc 0, pulado listado)" "$T/o" bash -c "grep -q 'RC=0' '$T/o' && grep -q 'ja existiam e NAO foram sobrescritos' '$T/o'"
+    restore_pty senha-errada
+    chk "senha errada: rc 1, nada extraido, sem marca" "$T/o" bash -c "grep -q 'RC=1' '$T/o' && [ ! -e '$H/docs/novo.txt' ] && [ ! -e '$H/.local/share/backup-ubuntu-restore/restore-concluido' ]"
+    echo lixo >> "$T/bk/backup-ubuntu-teste/backup.tar.gpg"
+    restore_pty senha-de-teste
+    chk "backup adulterado: sha256 nao confere, rc 1, nem pede senha" "$T/o" bash -c "grep -q 'RC=1' '$T/o' && grep -q 'sha256 NAO confere' '$T/o' && [ ! -e '$H/docs/novo.txt' ]"
 else
     pula "restore principal com terminal (falta script ou gpg)"
 fi
@@ -428,7 +450,7 @@ echo "== configuracao local fora do repo (repo publico)"
     etapa_harness > "$T/o" 2>&1 < /dev/null; rc=$?
     chk "sem configuracao: etapa harness pulada, rc 0, nada clonado" "$T/o" bash -c "[ $rc -eq 0 ] && grep -q 'sem HARNESS_REPO nem HARNESS_DIR' '$T/o'"
     # o repo e publico: nenhum nome privado do harness nos scripts e no README
-    priv="$(printf '%s|' dotfiles-cl''aude jar''vis pol''ly nm-vpn slack_''secret zsh_''secrets claude-re''mote kiro-re''mote xo-''cli '/v''oz')"
+    priv="$(printf '%s|' dotfiles-cl''aude jar''vis pol''ly nm-v''pn slack_''secret zsh_''secrets claude-re''mote kiro-re''mote xo-''cli '/v''oz')"
     grep -inE "${priv%|}" "$SETUP" "$AQUI/../backup.sh" "$AQUI/../README.md" > "$T/o"
     chk "sem nome privado do harness nos scripts e no README" "$T/o" test ! -s "$T/o"
 )
@@ -443,6 +465,93 @@ echo "== perfis de VPN do NetworkManager"
     confere_vpn_nm > "$T/o" 2>&1
     chk "com perfil vpn: silencio" "$T/o" test ! -s "$T/o"
 )
+
+echo "== backup.sh (HOME e destino temporarios, --sem-sudo, inventarios por shim)"
+BACKUP="$AQUI/../backup.sh"
+BINB="$T/bin-backup"; mkdir -p "$BINB"
+for c in apt-mark apt snap flatpak systemctl loginctl crontab dconf gnome-extensions code gh dkms zramctl swapon uv pipx cargo conda fc-list; do
+    printf '#!/bin/sh\nexit 0\n' > "$BINB/$c"
+done
+chmod +x "$BINB"/*
+bk_home() { # bk_home NOME: HOME de teste com o que entra e o que fica fora
+    HB="$T/bkhome-$1"; rm -rf "$HB"; mkdir -p "$HB/.ssh" "$HB/docs" "$HB/Downloads" "$HB/proj/node_modules/pk" "$HB/.cache/x" \
+        "$HB/.config/google-chrome/Default" "$HB/.nvm/versions/node/v24/lib/node_modules/npm" "$HB/proj/.venv/lib"
+    echo chave > "$HB/.ssh/id_teste"; echo doc > "$HB/docs/a.txt"; echo baixado > "$HB/Downloads/d.iso"
+    echo m > "$HB/proj/node_modules/pk/i.js"; echo c > "$HB/.cache/x/c"; echo n > "$HB/.nvm/versions/node/v24/lib/node_modules/npm/n.js"
+    echo nvm > "$HB/.nvm/nvm.sh"; echo v > "$HB/proj/.venv/lib/v.py"; echo p > "$HB/proj/main.py"
+    ln -s 'host-1234' "$HB/.config/google-chrome/Default/SingletonLock"   # symlink pendente, como o Chrome aberto
+    echo h > "$HB/docs/original"; ln "$HB/docs/original" "$HB/docs/hardlink"
+    mkdir -p "$HB/.config"; printf 'local-fora\n' > "$HB/.config/backup-ubuntu-excluir.txt"; mkdir -p "$HB/local-fora"; echo z > "$HB/local-fora/z"
+}
+(
+    export PATH="$BINB:$PATH"
+    bk_home a; DEST="$T/bkdest-a"; mkdir -p "$DEST"
+    HOME="$HB" bash "$BACKUP" "$DEST" --dry-run --sem-sudo > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "--dry-run: rc 0, nao grava nada no destino" "$T/o" bash -c "[ $rc -eq 0 ] && [ -z \"\$(ls -A '$DEST')\" ]"
+    chk "--dry-run lista o que fica fora: Downloads, node_modules, .venv, exclusao local" "$T/o" bash -c "grep -q 'Downloads' '$T/o' && grep -q 'node_modules' '$T/o' && grep -q '.venv' '$T/o' && grep -q 'local-fora (exclusao local' '$T/o'"
+    git init -q "$T/bk-repo"
+    HOME="$HB" bash "$BACKUP" "$T/bk-repo" --dry-run --sem-sudo > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "recusa destino dentro de repo git" "$T/o" bash -c "[ $rc -eq 1 ] && grep -q 'repositorio git' '$T/o'"
+    HOME="$HB" bash "$BACKUP" "$HB/docs" --dry-run --sem-sudo > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "recusa destino dentro do HOME" "$T/o" bash -c "[ $rc -eq 1 ] && grep -q 'dentro do seu HOME' '$T/o'"
+    HOME="$HB" bash "$BACKUP" "$DEST" --with-downloads > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "opcao antiga --with-downloads: recusada (contrato novo)" "$T/o" bash -c "[ $rc -eq 1 ] && grep -q 'opcao desconhecida' '$T/o'"
+)
+if command -v script >/dev/null 2>&1 && command -v gpg >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    # driver de pty: so digita a resposta depois que o prompt aparece (o backup mede o HOME antes de pedir a senha)
+    cat > "$T/driver_pty.py" <<'EOF'
+import os, pty, sys, time, select
+resp = sys.argv[1].split('\x1f') if sys.argv[1] else []
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp('bash', ['bash'] + sys.argv[2:])
+out = b''; fim = time.time() + 110
+while time.time() < fim:
+    r, _, _ = select.select([fd], [], [], 0.2)
+    if r:
+        try: d = os.read(fd, 4096)
+        except OSError: break
+        if not d: break
+        out += d
+        if resp and out.rstrip().endswith(b':'):
+            time.sleep(0.2); os.write(fd, (resp.pop(0) + '\n').encode())
+    elif os.waitpid(pid, os.WNOHANG)[0]: break
+sys.stdout.write(out.decode('utf-8', 'replace'))
+EOF
+    cat > "$T/pty-backup.sh" <<EOF
+#!/usr/bin/env bash
+export PATH="$BINB:\$PATH" HOME="\$1" GNUPGHOME="$T/gnupg-bkr"; shift
+mkdir -p "\$GNUPGHOME"; chmod 700 "\$GNUPGHOME"
+bash "$BACKUP" "\$@"; echo "RC=\$?"
+EOF
+    bk_pty() { local r="$1"; shift; timeout 120 python3 "$T/driver_pty.py" "$r" "$T/pty-backup.sh" "$@" > "$T/o" 2>&1; }
+    S=$'\x1f'
+    ( bk_home b; DEST="$T/bkdest-b"; mkdir -p "$DEST"
+      bk_pty "curta${S}curta" "$HB" "$DEST" --sem-sudo
+      chk "senha com menos de 10 caracteres: recusa" "$T/o" bash -c "grep -q 'RC=1' '$T/o' && grep -q 'pelo menos 10' '$T/o' && [ -z \"\$(ls -A '$DEST')\" ]"
+      bk_pty "senha-de-teste-ok${S}senha-de-teste-ok" "$HB" "$DEST" --sem-sudo
+      P="$(ls -d "$DEST"/backup-ubuntu-* 2>/dev/null | head -1)"
+      chk "backup: rc 0 (symlink pendente nao vira erro), gera tar.gpg, SHA256SUMS e MANIFESTO" "$T/o" bash -c "grep -q 'RC=0' '$T/o' && [ -f '$P/backup.tar.gpg' ] && [ -f '$P/SHA256SUMS' ] && [ -f '$P/MANIFESTO.txt' ] && ! grep -q 'ERROS DE LEITURA' '$T/o'"
+      chk "MANIFESTO lista .venv no FORA DO BACKUP (nome com ponto)" "$P/MANIFESTO.txt" grep -q '^\*\*/\.venv ' "$P/MANIFESTO.txt"
+      GNUPGHOME="$T/gnupg-bkr" gpg --batch --pinentry-mode loopback --passphrase-fd 3 -d "$P/backup.tar.gpg" 3< <(printf '%s' senha-de-teste-ok) 2>/dev/null | tar -tvf - > "$T/lista" 2>/dev/null
+      chk "o tar tem o HOME e o meta" "$T/lista" bash -c "grep -q ' .ssh/id_teste$' '$T/lista' && grep -q ' docs/a.txt$' '$T/lista' && grep -q ' proj/main.py$' '$T/lista' && grep -q '.backup-ubuntu-meta/inventario/home-origem.txt' '$T/lista'"
+      chk "o tar nao tem Downloads, .cache, node_modules, .venv, ~/.nvm/versions nem a exclusao local" "$T/lista" bash -c "! grep -qE ' (Downloads/|\\.cache/|proj/node_modules/|proj/\\.venv/|\\.nvm/versions/|local-fora/)' '$T/lista' && grep -q ' .nvm/nvm.sh$' '$T/lista'"
+      chk "hardlink entra como arquivo proprio (--hard-dereference)" "$T/lista" bash -c "grep -q ' docs/hardlink$' '$T/lista' && ! grep -q 'link to' '$T/lista'"
+      bk_pty "senha-de-teste-ok" "$HB" --verificar "$P"
+      chk "--verificar: sha256 confere e o numero de entradas bate com o MANIFESTO" "$T/o" bash -c "grep -q 'RC=0' '$T/o' && grep -q 'igual ao MANIFESTO' '$T/o'"
+      bk_pty "senha-errada" "$HB" --verificar "$P"
+      chk "--verificar com senha errada: rc 1" "$T/o" bash -c "grep -q 'RC=1' '$T/o' && grep -q 'falha ao decifrar' '$T/o'"
+      [ -n "$P" ] && echo lixo >> "$P/backup.tar.gpg"
+      bk_pty "senha-de-teste-ok" "$HB" --verificar "$P"
+      chk "--verificar com arquivo adulterado: rc 1 antes de pedir a senha" "$T/o" bash -c "grep -q 'RC=1' '$T/o' && grep -q 'sha256 NAO confere' '$T/o' && ! grep -q 'Senha do backup' '$T/o'"
+      bk_home c; DEST="$T/bkdest-c"; mkdir -p "$DEST"; echo s > "$HB/docs/sem-leitura"; chmod 000 "$HB/docs/sem-leitura"
+      bk_pty "senha-de-teste-ok${S}senha-de-teste-ok" "$HB" "$DEST" --sem-sudo --rapido
+      chmod 600 "$HB/docs/sem-leitura"
+      if [ "$(id -u)" -eq 0 ]; then pula "arquivo ilegivel (rodando como root)"
+      else chk "arquivo ilegivel: o backup e gravado mas sai com 1 e lista o erro (rc 2 do tar nao passa em silencio)" "$T/o" bash -c "grep -q 'RC=1' '$T/o' && grep -q 'ERROS DE LEITURA' '$T/o' && grep -q 'sem-leitura' '$T/o' && ls -d '$DEST'/backup-ubuntu-*/backup.tar.gpg >/dev/null"; fi )
+else
+    pula "backup.sh com terminal (falta script, gpg ou python3)"
+fi
 
 echo
 N_OK=$(grep -c '^ok$' "$RES"); N_FALHA=$(grep -c '^falha$' "$RES"); N_PULOU=$(grep -c '^pulou$' "$RES")

@@ -45,7 +45,17 @@ Destino aceito: NTFS, exFAT, ext4. FAT32 é recusado (limite de 4 GB por arquivo
 | A ESP de fábrica do notebook ficou com a entrada "Windows Boot Manager" e `EFI/Microsoft` sem Windows. | `--limpa-efi-windows` (nunca por padrão): confere que o Ubuntu tem entrada e loader próprios, avisa se há NTFS/BitLocker no mesmo disco, guarda uma cópia de `EFI/Microsoft` em `~/.local/share/backup-ubuntu-restore/`, e só remove (`efibootmgr -B` + a pasta) depois de digitar `APAGAR` no terminal. Sem terminal, não faz nada. |
 | Os perfis de VPN do NetworkManager não vieram. | Ficam em `/etc/NetworkManager/system-connections` (root): só entram no backup com sudo. No fim, o setup avisa se não há perfil `vpn`/`wireguard` no NetworkManager e mostra como importar (`nmcli connection import`). |
 
-Testes: `timeout 300 ./tests/test-setup-funcoes.sh` carrega só as funções (`SETUP_SO_FUNCOES=1`), com HOME temporário e `sudo`, `snap`, `efibootmgr`, `nmcli` trocados por shims. Não roda o setup, não usa sudo real nem toca a ESP.
+Testes: `timeout 300 ./tests/test-setup-funcoes.sh`. Carrega só as funções do setup (`SETUP_SO_FUNCOES=1`), com HOME temporário
+e `sudo`, `snap`, `efibootmgr`, `nmcli`, `systemctl` trocados por shims; roda o `backup.sh` de verdade sobre um HOME e um destino
+temporários (`--sem-sudo`, inventários por shim) e o restore e o delta com gpg real num `GNUPGHOME` temporário. Não roda o setup,
+não usa sudo real, não toca a ESP nem o `/etc` da máquina. Precisa de `gpg`, `script` e `python3` (os testes com terminal pulam sem eles).
+
+## Mudou em relação à versão antiga
+
+- `backup.sh` agora exige `DESTINO`; `--with-downloads` não existe mais (Downloads fica fora; para levar, copie à parte).
+- O formato mudou de `secrets.tar.gpg` + `dotfiles/` + `data/` para um `backup.tar.gpg` só. Backup da versão antiga não tem restore aqui.
+- `./ubuntu-setup-automated.sh <pasta>` virou `--restore <pasta>` (o formato antigo sai com código 2).
+- O restore roda o `tar` com `LC_ALL=C`: o parse dos arquivos pulados depende da mensagem em inglês.
 
 ## O que o backup leva
 

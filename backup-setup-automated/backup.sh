@@ -34,7 +34,8 @@
 # copias de /etc, perfis de VPN do NetworkManager e o sha256 por arquivo. O
 # ubuntu-setup-automated.sh --restore le tudo isso.
 #==============================================================================
-# shellcheck disable=SC2088
+# shellcheck disable=SC2088,SC2016
+# (~ literal nas mensagens; $HOME em aspas simples e expandido pelo bash -c / sh -c de proposito)
 set -euo pipefail
 umask 077
 
@@ -159,6 +160,7 @@ EXCL_ANC=(
     '.local/share/containers' '.local/share/docker'
     'snap/*/common/.cache'
     '.aws/sso/cache' '.aws/cli/cache' '.terraform.d/plugin-cache'
+    '.nvm/versions'
     '.kiro/crew-venv' '.kiro/.crew-venv-*' '.kiro/crew-python' '.kiro/extensions' '.kiro/logs'
     '.claude/cache' '.claude/shell-snapshots' '.claude/statsig' '.claude/telemetry'
 )
@@ -287,12 +289,12 @@ calcula_fora() {
     for p in .cache .npm .local/share/Trash .local/share/containers .local/share/docker; do prune+=(-path "$HOME/$p" -o); done
     prune+=(-path "$HOME/.cargo/registry")
     while IFS= read -r -d '' p; do
-        printf '%s\0' "$p" >> "$bk/$(basename "$p")"
+        printf '%s\0' "$p" >> "$bk/n-$(basename "$p")"   # prefixo: o glob abaixo nao pega nome com ponto (.venv)
     done < <(find "$HOME" \( "${prune[@]}" \) -prune -o -type d \( -name node_modules -o -name .terraform -o -name .venv -o -name venv -o -name __pycache__ -o -name .pytest_cache -o -name .mypy_cache \) -prune -print0 2>/dev/null)
     local f nome b
     for f in "$bk"/*; do
         [ -f "$f" ] || continue
-        nome="$(basename "$f")"
+        nome="$(basename "$f")"; nome="${nome#n-}"
         b="$(du -sbc --files0-from="$f" 2>/dev/null | tail -1 | cut -f1 || true)"; b="${b:-0}"
         printf '**/%s (em qualquer pasta; .terraform.lock.hcl fica) | %s (%s pastas)\n' "$nome" "$(fmt_bytes "$b")" "$(tr -cd '\0' < "$f" | wc -c)" >> "$FORA"
     done
@@ -441,6 +443,7 @@ monta_manifesto() {
     local arq_info="${1:-}" entradas="${2:-}"
     echo "MANIFESTO DO BACKUP - ubuntu ($NOME)"
     echo "Gerado em: $(date '+%Y-%m-%d %H:%M:%S %z')   script: backup.sh $VERSAO_SCRIPT"
+    # shellcheck disable=SC1091
     echo "Maquina: $HOST   usuario: $(id -un)   SO: $(. /etc/os-release; echo "$PRETTY_NAME")   kernel: $(uname -r)"
     echo "Modo: $($DRY_RUN && echo 'DRY-RUN (nada foi gravado)' || echo 'COMPLETO')"
     echo
@@ -456,6 +459,8 @@ monta_manifesto() {
     echo "== FORA DO BACKUP (excluido de proposito, com tamanho) =="
     sort "$FORA"
     echo "Nao salvo (refaz no setup): login do tailscale, login do gh/aws sso, chaves MOK do DKMS, token do Kiro se expirado."
+    echo "Fora do HOME e fora do backup: volumes e imagens do Docker (/var/lib/docker), /opt e /usr/local/bin (bin-fora-do-apt.txt so lista os nomes)."
+    echo "Node do nvm (~/.nvm/versions) fica fora: o setup reinstala o Node e os pacotes npm globais da lista."
     echo
     echo "== Tamanho =="
     echo "Dados a arquivar (sem compressao): $(fmt_bytes "$EST")   espaco livre no destino: $(fmt_bytes "$LIVRE")   fs: $FSTIPO"
@@ -497,7 +502,9 @@ done < "$DEREF_LIST"
 if ! $RAPIDO; then
     info "Calculando sha256 por arquivo (config e segredos)..."
     tar --null "${TAR_EXCL[@]}" -C "$HOME" -T "$LISTA_SHA" -cvf /dev/null 2>/dev/null \
-        | grep -v '/$' | tr '\n' '\0' | (cd "$HOME" && xargs -0 -r -n50 sha256sum 2>>"$ERROS_LEITURA") \
+        | grep -v '/$' | tr '\n' '\0' \
+        | (cd "$HOME" && xargs -0 -r sh -c 'for f; do [ -f "$f" ] && [ ! -L "$f" ] && printf "%s\0" "$f"; done; exit 0' _ \
+            | xargs -0 -r -n50 sha256sum 2>>"$ERROS_LEITURA") \
         > "$STAGE/$META/SHA256-ARQUIVOS.txt" || true
 fi
 
@@ -521,7 +528,9 @@ info "Arquivando e cifrando (pode levar bastante; ~$(fmt_bytes "$EST") sem compr
 # Sem --ignore-failed-read: arquivo ilegivel vira erro listado no fim (tar rc 2), nunca silencio.
 trap - ERR
 set +e
-tar --null --warning=no-file-changed --warning=no-file-ignored --index-file="$INDICE" -v \
+# --hard-dereference: hardlink entra como arquivo proprio (no restore de 06/11 o .git/index era hardlink de outro
+# arquivo e virou o conteudo dele).
+tar --null --hard-dereference --warning=no-file-changed --warning=no-file-ignored --index-file="$INDICE" -v \
     "${TAR_EXCL[@]}" -cf - -C "$HOME" -T "$LISTA" -C "$STAGE" "$META" 2>"$WORK/tar.err" \
   | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --symmetric \
         --cipher-algo AES256 --s2k-mode 3 --s2k-digest-algo SHA512 --s2k-count 65011712 \

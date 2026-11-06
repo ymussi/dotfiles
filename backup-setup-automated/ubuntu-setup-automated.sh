@@ -200,7 +200,7 @@ tem() { command -v "$1" >/dev/null 2>&1; }
 conf() {
     local k="$1" v="${!1:-}"
     if [ -z "$v" ] && [ -f "$SETUP_CONF" ]; then
-        v="$(sed -n "s/^[[:space:]]*$k[[:space:]]*=[[:space:]]*//p" "$SETUP_CONF" | tail -1 \
+        v="$(sed -n "s/^[[:space:]]*${k}[[:space:]]*=[[:space:]]*//p" "$SETUP_CONF" | tail -1 \
             | sed -E -e 's/[[:space:]]+$//' -e "s/^([\"'])(.*)\\1\$/\\2/")"
     fi
     printf '%s' "$v"
@@ -834,7 +834,7 @@ acha_backup() {
     if $AUTO_RESTORE && [ -z "$alvo" ]; then
         alvo="$(ls -dt /media/"$USER"/*/backup-ubuntu-*/ /run/media/"$USER"/*/backup-ubuntu-*/ 2>/dev/null | head -1)"
         [ -n "$alvo" ] || { erro "nao achei backup-ubuntu-* em /media/$USER/*"; return 1; }
-        info "backup encontrado: $alvo"
+        info "backup encontrado: $alvo" >&2
     fi
     [ -n "$alvo" ] || return 1
     if [ -d "$alvo" ]; then alvo="${alvo%/}/backup.tar.gpg"; fi
@@ -932,6 +932,7 @@ restaura_etc() { # restaura_etc PASTA_RAIZ_DO_BACKUP HOME_DE_ORIGEM
     done
     [ -s "$RESTORE_DIR/etc-nao-restaurado.txt" ] || rm -f "$RESTORE_DIR/etc-nao-restaurado.txt"
     if sudo test -f "$rs/etc/hosts"; then
+        # shellcheck disable=SC2024  # a copia e do usuario, de proposito (so para conferir)
         sudo cat "$rs/etc/hosts" > "$RESTORE_DIR/hosts.origem" 2>/dev/null \
             && info "hosts de origem em $RESTORE_DIR/hosts.origem (nao aplicado automaticamente; confira)."
     fi
@@ -968,13 +969,14 @@ etapa_restore() {
     mapfile -t excl < <(tar_nao_migra)
     set +e
     gpg --batch --pinentry-mode loopback --passphrase-fd 3 -d "$arq" 3< <(printf '%s' "$PASS") 2>/dev/null \
-        | tar -x --keep-old-files --no-same-owner --anchored "${excl[@]}" -C "$HOME" 2>"$tarerr"
+        | LC_ALL=C tar -x --keep-old-files --no-same-owner --anchored "${excl[@]}" -C "$HOME" 2>"$tarerr"
     rc=("${PIPESTATUS[@]}")
     PASS=""
     # --keep-old-files avisa "Cannot open: File exists" por arquivo pulado e segue; qualquer outro erro e falha.
+    # O tar roda com LC_ALL=C: em pt_BR a mensagem sai traduzida e o parse abaixo nao a reconheceria.
     local pulados outros
-    pulados="$(sed -n 's/^tar: \(.*\): Cannot open: File exists$/\1/p' "$tarerr")"
-    outros="$(grep -v 'Cannot open: File exists$' "$tarerr" | grep -v '^tar: Exiting with failure status due to previous errors$' || true)"
+    pulados="$(sed -n 's/^[^ ]*tar: \(.*\): Cannot open: File exists$/\1/p' "$tarerr")"
+    outros="$(grep -v 'Cannot open: File exists$' "$tarerr" | grep -v 'tar: Exiting with failure status due to previous errors$' || true)"
     rm -f "$tarerr"
     if [ "${rc[0]}" -ne 0 ] || [ "${rc[1]}" -gt 2 ] || { [ "${rc[1]}" -ne 0 ] && [ -n "$outros" ]; }; then
         erro "falha ao decifrar/extrair (senha errada? gpg=${rc[0]} tar=${rc[1]})"; [ -z "$outros" ] || printf '%s\n' "$outros" | head -10 >&2; return 1
@@ -1058,7 +1060,7 @@ etapa_delta() {
     local rc tarerr excl=(); tarerr="$(mktemp)"
     mapfile -t excl < <(tar_nao_migra)
     gpg --batch --pinentry-mode loopback --passphrase-fd 3 -d "$arq" 3< <(printf '%s' "$PASS") 2>/dev/null \
-        | tar -x --no-same-owner --no-overwrite-dir --anchored "${excl[@]}" -C "$HOME" 2>"$tarerr"
+        | LC_ALL=C tar -x --no-same-owner --no-overwrite-dir --anchored "${excl[@]}" -C "$HOME" 2>"$tarerr"
     rc=("${PIPESTATUS[@]}")
     PASS=""
     if [ "${rc[0]}" -ne 0 ] || [ "${rc[1]}" -ne 0 ]; then
