@@ -60,8 +60,13 @@ chmod +x "$BIN"/*
 prologo() { # prologo NOME
     export HOME="$T/home-$1" PATH="$BIN:$PATH" SETUP_SO_FUNCOES=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
     export GNUPGHOME="$T/gnupg-$1"; mkdir -p "$HOME" "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
+    # sem parametros: o source herda $@ de quem chama e o parser de opcoes do setup sairia com 2
+    set --
     # shellcheck disable=SC1090
     source "$SETUP" >/dev/null 2>&1
+    # o declare -A do setup, executado dentro desta funcao, vira local a ela: recria no escopo global
+    declare -gA SO=() PULAR=()
+    if ! declare -F etapa_delta >/dev/null; then nok "prologo $1: funcoes do setup nao carregaram"; exit 1; fi
 }
 
 echo "== CLI (sai antes de qualquer etapa)"
@@ -203,10 +208,11 @@ efi_ambiente() { # efi_ambiente NOME: ESP de mentira com Windows e Ubuntu
 if command -v script >/dev/null 2>&1; then
     cat > "$T/pty-efi.sh" <<EOF
 #!/usr/bin/env bash
-export PATH="$BIN:\$PATH" HOME="$T/home-efi-\$1" SETUP_SO_FUNCOES=1
+NOME="\$1"; set --
+export PATH="$BIN:\$PATH" HOME="$T/home-efi-\$NOME" SETUP_SO_FUNCOES=1
 mkdir -p "\$HOME"
 source "$SETUP" >/dev/null 2>&1
-LIMPA_EFI=true; ESP_DIR="$T/esp-\$1"; EFI_SYSFS="$T/sysfs-efi"
+LIMPA_EFI=true; ESP_DIR="$T/esp-\$NOME"; EFI_SYSFS="$T/sysfs-efi"
 etapa_efi_windows; echo "RC=\$?"
 EOF
     ( efi_ambiente c; printf 'vfat\nntfs\n' > "$T/lsblk.fs"
