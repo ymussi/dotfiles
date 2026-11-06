@@ -161,7 +161,9 @@ apt_faltantes() { # imprime so os pacotes que ainda nao estao instalados e exist
     done
 }
 apt_garante() {
-    local falt p rc=0; falt="$(apt_faltantes "$@")"
+    local falt p rc=0
+    apt_update_se_sujo || warn "apt update falhou; sigo com a lista atual"
+    falt="$(apt_faltantes "$@")"
     [ -z "$falt" ] && return 0
     # shellcheck disable=SC2086
     TMO 1200 sudo apt-get install -y --no-install-recommends $falt && return 0
@@ -747,6 +749,73 @@ fecha_permissoes() {
     return 0
 }
 
+# /etc do backup. O tar extrai em ~/.backup-ubuntu-meta/raiz, pasta que o usuario escreve; por isso nada e
+# instalado de la: tudo e copiado antes para uma pasta de root (0700) e validado e instalado dessa copia, de
+# modo que o arquivo conferido e o instalado sao o mesmo. O que da poder de root (sudoers, ssh, systemd, udev,
+# modprobe, apt, openvpn) so entra depois de mostrar a lista e digitar RESTAURAR no terminal.
+# ETC_DEST e ETC_STAGE_BASE: so para teste (prefixo do destino e base da pasta de root).
+ETC_DEST="${ETC_DEST:-}"
+ETC_STAGE_BASE="${ETC_STAGE_BASE:-/root}"
+etc_sensivel() {
+    case "$1" in
+        /etc/sudoers.d/*|/etc/ssh/*|/etc/systemd/*|/etc/udev/*|/etc/modprobe.d/*|/etc/modules-load.d/*|/etc/apt/*|/etc/openvpn/*) return 0 ;;
+    esac
+    return 1
+}
+sed_padrao() { printf '%s' "$1" | sed 's/[]\/$*.^[#]/\\&/g'; }
+sed_troca()  { printf '%s' "$1" | sed 's/[\/&#]/\\&/g'; }
+restaura_etc() { # restaura_etc PASTA_RAIZ_DO_BACKUP HOME_DE_ORIGEM
+    local raiz="$1" origem="$2" rs f rel modo r n=0 rc=0 nm=false
+    [ -d "$raiz/etc" ] || return 0
+    rs="$(sudo mktemp -d "$ETC_STAGE_BASE/backup-ubuntu-etc.XXXXXX")" || { warn "nao criei a pasta de root para o /etc do backup: /etc NAO restaurado"; return 1; }
+    if ! { sudo cp -a --no-preserve=ownership "$raiz/etc" "$rs/" && sudo chown -R 0:0 "$rs" && sudo chmod -R go-rwx "$rs"; }; then
+        sudo rm -rf -- "$rs"; warn "nao copiei o /etc do backup para a pasta de root: /etc NAO restaurado"; return 1
+    fi
+    # perfis do NetworkManager: o HOME de origem vira o atual, ja na copia de root
+    if [ -n "$origem" ] && [ "$origem" != "$HOME" ] && sudo test -d "$rs/etc/NetworkManager/system-connections"; then
+        sudo find "$rs/etc/NetworkManager/system-connections" -type f -exec \
+            sed -i "s#$(sed_padrao "$origem")#$(sed_troca "$HOME")#g" {} + || { warn "nao reescrevi o HOME nos perfis do NetworkManager"; rc=1; }
+    fi
+    local -a inst=() sens=()
+    while IFS= read -r f; do
+        rel="${f#"$rs"}"
+        case "$rel" in /etc/systemd/zram-generator.conf*|/etc/hosts) continue ;; esac
+        if sudo test -e "$ETC_DEST$rel"; then skip "/etc: $rel ja existe"; continue; fi
+        if etc_sensivel "$rel"; then sens+=("$f"); else inst+=("$f"); fi
+    done < <(sudo find "$rs/etc" -type f | sort)
+    mkdir -p "$RESTORE_DIR"; : > "$RESTORE_DIR/etc-nao-restaurado.txt"
+    if [ ${#sens[@]} -gt 0 ]; then
+        warn "${#sens[@]} arquivo(s) do backup em /etc dao poder de root (sudoers, ssh, systemd, udev, modprobe, apt, openvpn):"
+        for f in "${sens[@]}"; do printf '    %s\n' "${f#"$rs"}" >&2; done
+        r=""; if [ -t 0 ]; then IFS= read -r -p "Restaurar estes arquivos em /etc? Digite RESTAURAR (outra coisa pula): " r; fi
+        if [ "$r" = RESTAURAR ]; then inst+=("${sens[@]}")
+        else
+            for f in "${sens[@]}"; do printf '%s\n' "${f#"$rs"}" >> "$RESTORE_DIR/etc-nao-restaurado.txt"; done
+            warn "NAO restaurados (lista em $RESTORE_DIR/etc-nao-restaurado.txt). Para restaurar depois: --so restore --refazer-restore e responder RESTAURAR."
+        fi
+    fi
+    for f in "${inst[@]+"${inst[@]}"}"; do
+        rel="${f#"$rs"}"; modo=644
+        case "$rel" in /etc/sudoers.d/*) modo=440 ;; /etc/NetworkManager/*|/etc/openvpn/*|/etc/ssh/*|/etc/netplan/*) modo=600 ;; esac
+        if [ "$modo" = 440 ] && ! sudo visudo -cf "$f" >/dev/null 2>&1; then warn "sudoers invalido no backup, NAO restaurado: $rel"; rc=1; continue; fi
+        if sudo install -D -o root -g root -m "$modo" "$f" "$ETC_DEST$rel"; then
+            n=$((n+1))
+            case "$rel" in /etc/apt/*) APT_SUJO=true ;; /etc/NetworkManager/system-connections/*) nm=true ;; esac
+        else warn "nao restaurei $rel"; rc=1; fi
+    done
+    [ -s "$RESTORE_DIR/etc-nao-restaurado.txt" ] || rm -f "$RESTORE_DIR/etc-nao-restaurado.txt"
+    if sudo test -f "$rs/etc/hosts"; then
+        sudo cat "$rs/etc/hosts" > "$RESTORE_DIR/hosts.origem" 2>/dev/null \
+            && info "hosts de origem em $RESTORE_DIR/hosts.origem (nao aplicado automaticamente; confira)."
+    fi
+    sudo rm -rf -- "$rs"
+    $nm && { sudo nmcli connection reload 2>/dev/null || true; }
+    # fonte/chave do apt restaurada: o proximo apt-get install precisa de um update antes
+    $APT_SUJO && info "fontes do apt restauradas: o apt update roda antes da proxima instalacao."
+    info "/etc: $n arquivo(s) restaurado(s)."
+    return $rc
+}
+
 etapa_restore() {
     local arq
     if [ -z "$RESTORE_ARG" ] && ! $AUTO_RESTORE; then
@@ -797,37 +866,9 @@ etapa_restore() {
     fi
     fecha_permissoes
 
-    # Perfis de VPN do NetworkManager (reescreve o HOME de origem, se o usuario mudou)
-    local raiz="$meta/raiz" origem; origem="$(cat "$meta/inventario/home-origem.txt" 2>/dev/null || true)"
-    if [ -d "$raiz/etc/NetworkManager/system-connections" ]; then
-        local f
-        for f in "$raiz/etc/NetworkManager/system-connections"/*; do
-            [ -f "$f" ] || continue
-            local dst; dst="/etc/NetworkManager/system-connections/$(basename "$f")"
-            [ -f "$dst" ] && { skip "VPN $(basename "$f")"; continue; }
-            if [ -n "$origem" ] && [ "$origem" != "$HOME" ]; then
-                sed "s#$origem#$HOME#g" "$f" | sudo install -o root -g root -m 600 /dev/stdin "$dst"
-            else sudo install -o root -g root -m 600 "$f" "$dst"; fi
-        done
-        sudo nmcli connection reload 2>/dev/null || true
-    fi
-    # /etc que mudou (zram e DKMS sao tratados nas proprias etapas; o resto vem so se ainda nao existe)
-    if [ -d "$raiz/etc" ]; then
-        local f rel
-        while IFS= read -r f; do
-            rel="${f#"$raiz"}"
-            case "$rel" in /etc/NetworkManager/system-connections/*|/etc/systemd/zram-generator.conf*|/etc/hosts) continue ;; esac
-            if [ -e "$rel" ]; then skip "/etc: $rel ja existe"; continue; fi
-            local modo=644
-            case "$rel" in /etc/sudoers.d/*) modo=440 ;; /etc/NetworkManager/*|/etc/openvpn/*|/etc/ssh/*|/etc/netplan/*) modo=600 ;; esac
-            if [ "$modo" = 440 ]; then
-                if ! sudo visudo -cf "$f" >/dev/null 2>&1; then warn "sudoers invalido no backup, NAO restaurado: $rel"; continue; fi
-            fi
-            sudo mkdir -p "$(dirname "$rel")" && sudo install -o root -g root -m "$modo" "$f" "$rel" || warn "nao restaurei $rel"
-        done < <(find "$raiz/etc" -type f)
-        info "hosts de origem em $raiz/etc/hosts (nao aplicado automaticamente; confira)."
-        mkdir -p "$RESTORE_DIR" && cp -a "$raiz/etc/hosts" "$RESTORE_DIR/hosts.origem" 2>/dev/null || true
-    fi
+    # /etc do backup (perfis do NetworkManager inclusos): validado e instalado a partir de uma copia de root
+    local origem; origem="$(cat "$meta/inventario/home-origem.txt" 2>/dev/null || true)"
+    restaura_etc "$meta/raiz" "$origem" || warn "parte do /etc do backup nao foi restaurada (veja os avisos acima)"
     # Listas de pacotes (alimentam a etapa "pacotes"), lista de repos a clonar (etapa "projetos") e manifesto
     mkdir -p "$RESTORE_DIR"
     cp -a "$meta/inventario" "$RESTORE_DIR/" 2>/dev/null || true

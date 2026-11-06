@@ -60,8 +60,11 @@ Erro de leitura (arquivo sem permissão etc.) não passa em silêncio: o script 
   `apt-repos`, `bin-fora-do-apt`, `appimages`, `fontes-usuario`, `systemd-user-enabled`, `dkms-status`, `versoes-ferramentas`.
 - **Repos de `~/projects`**: a lista com o remoto de cada um vai junto; o setup reclona o que faltar.
 - **Sistema (sudo)**: `/etc/NetworkManager/system-connections`, `zram-generator.conf`, `sudoers.d`, `apt/sources.list.d` e chaves,
-  DKMS, e o que em `/etc` não vem de pacote. `--sem-sudo` pula essa parte. No restore, vai com `sudo install -o root -g root`
-  e `sudoers.d` só entra se passar no `visudo -c`.
+  DKMS, e o que em `/etc` não vem de pacote. `--sem-sudo` pula essa parte. Os perfis do NetworkManager levam também as
+  senhas de Wi-Fi salvas. No restore, o `/etc` do backup é copiado para uma pasta de root (0700) e validado e instalado de
+  lá (`sudo install -o root -g root`), nunca direto da pasta do usuário; `sudoers.d` só entra se passar no `visudo -c`.
+  O que dá poder de root (`sudoers.d`, `ssh`, `systemd`, `udev`, `modprobe.d`, `apt`, `openvpn`) só entra depois de mostrar a
+  lista e digitar `RESTAURAR`; sem isso fica de fora, listado em `~/.local/share/backup-ubuntu-restore/etc-nao-restaurado.txt`.
 
 O destino não pode estar num repo git nem no HOME: o arquivo leva segredos.
 

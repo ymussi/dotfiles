@@ -226,6 +226,69 @@ else
     pula "EFI com terminal (falta script)"
 fi
 
+echo "== /etc do backup: copia de root, validacao e confirmacao"
+# sudo de teste: sem root de verdade, chown vira no-op e install perde -o/-g. O visudo de mentira troca o
+# arquivo da pasta do usuario (simula a troca entre validar e instalar) e so aceita o que tem VALIDO.
+BINR="$T/bin-root"; mkdir -p "$BINR"
+cat > "$BINR/sudo" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = "-v" ] && exit 0
+case "$1" in
+    chown) exit 0 ;;
+    install) shift; a=(); while [ $# -gt 0 ]; do case "$1" in -o|-g) shift 2 ;; *) a+=("$1"); shift ;; esac; done; exec install "${a[@]}" ;;
+esac
+exec "$@"
+EOF
+cat > "$BINR/visudo" <<'EOF'
+#!/usr/bin/env bash
+[ -n "${TROCA_ORIGEM:-}" ] && echo 'ALL ALL=(ALL) NOPASSWD: ALL # EVIL' > "$TROCA_ORIGEM"
+grep -q VALIDO "$2"
+EOF
+chmod +x "$BINR"/*
+etc_ambiente() { # etc_ambiente NOME: raiz de backup com sudoers, apt, NetworkManager e um arquivo comum
+    R="$T/raiz-$1"; rm -rf "$R" "$T/etcdest-$1" "$T/rootstage-$1"; mkdir -p "$T/etcdest-$1" "$T/rootstage-$1"
+    mkdir -p "$R/etc/sudoers.d" "$R/etc/apt/sources.list.d" "$R/etc/NetworkManager/system-connections" "$R/etc/sysctl.d"
+    echo 'usuario ALL=(ALL) ALL # VALIDO' > "$R/etc/sudoers.d/10-usuario"
+    echo 'Types: deb' > "$R/etc/apt/sources.list.d/x.sources"
+    printf '[vpn]\nca=/home/velho/.cert/ca.crt\n' > "$R/etc/NetworkManager/system-connections/vpn1.nmconnection"
+    echo 'vm.x = 1' > "$R/etc/sysctl.d/90-x.conf"
+    echo '127.0.0.1 localhost' > "$R/etc/hosts"
+    echo invalido > "$R/etc/sudoers.d/99-ruim"
+}
+(
+    prologo etc0
+    export PATH="$BINR:$PATH"
+    etc_ambiente a; ETC_DEST="$T/etcdest-a"; ETC_STAGE_BASE="$T/rootstage-a"; APT_SUJO=false
+    restaura_etc "$R" /home/velho > "$T/o" 2>&1 < /dev/null; rc=$?
+    D="$T/etcdest-a/etc"
+    chk "sem terminal: comum entra, sudoers e apt ficam de fora e listados" "$T/o" bash -c "[ -f '$D/sysctl.d/90-x.conf' ] && [ ! -e '$D/sudoers.d/10-usuario' ] && [ ! -e '$D/apt/sources.list.d/x.sources' ] && grep -qx /etc/sudoers.d/10-usuario '$RESTORE_DIR/etc-nao-restaurado.txt' && grep -qx /etc/apt/sources.list.d/x.sources '$RESTORE_DIR/etc-nao-restaurado.txt'"
+    chk "perfil do NetworkManager entra com o HOME novo, modo 600" "$T/o" bash -c "grep -qx 'ca=$HOME/.cert/ca.crt' '$D/NetworkManager/system-connections/vpn1.nmconnection' && [ \$(stat -c %a '$D/NetworkManager/system-connections/vpn1.nmconnection') = 600 ]"
+    chk "a pasta do usuario nao muda (sed na copia de root) e a copia de root some no fim" "$T/o" bash -c "grep -q /home/velho '$R/etc/NetworkManager/system-connections/vpn1.nmconnection' && [ -z \"\$(ls -A '$T/rootstage-a')\" ]"
+    chk "hosts de origem guardado, nao aplicado" "$T/o" bash -c "[ -f '$RESTORE_DIR/hosts.origem' ] && [ ! -e '$D/hosts' ]"
+    restaura_etc "$R" /home/velho > "$T/o" 2>&1 < /dev/null
+    chk "rodar de novo: o que ja existe e pulado" "$T/o" grep -q 'sysctl.d/90-x.conf ja existe' "$T/o"
+)
+if command -v script >/dev/null 2>&1; then
+    cat > "$T/pty-etc.sh" <<EOF
+#!/usr/bin/env bash
+set --
+export PATH="$BINR:$BIN:\$PATH" HOME="$T/home-etc1" SETUP_SO_FUNCOES=1
+mkdir -p "\$HOME"
+source "$SETUP" >/dev/null 2>&1
+ETC_DEST="$T/etcdest-b"; ETC_STAGE_BASE="$T/rootstage-b"; APT_SUJO=false
+export TROCA_ORIGEM="$T/raiz-b/etc/sudoers.d/10-usuario"
+restaura_etc "$T/raiz-b" "\$HOME"; echo "RC=\$?"; echo "APT_SUJO=\$APT_SUJO"
+EOF
+    ( etc_ambiente b
+      (sleep 2; printf 'RESTAURAR\n') | timeout 60 script -qec "bash $T/pty-etc.sh" /dev/null > "$T/o" 2>&1
+      D="$T/etcdest-b/etc"
+      chk "RESTAURAR: sudoers valido e apt entram, sudoers invalido nao (rc 1)" "$T/o" bash -c "grep -q 'RC=1' '$T/o' && [ -f '$D/sudoers.d/10-usuario' ] && [ ! -e '$D/sudoers.d/99-ruim' ] && [ -f '$D/apt/sources.list.d/x.sources' ] && [ \$(stat -c %a '$D/sudoers.d/10-usuario') = 440 ]"
+      chk "troca do arquivo do usuario depois de validar nao chega ao /etc" "$T/o" bash -c "grep -q EVIL '$T/raiz-b/etc/sudoers.d/10-usuario' && ! grep -q EVIL '$D/sudoers.d/10-usuario'"
+      chk "fonte do apt restaurada marca o apt para update" "$T/o" grep -q 'APT_SUJO=true' "$T/o" )
+else
+    pula "/etc com terminal (falta script)"
+fi
+
 echo "== perfis de VPN do NetworkManager"
 (
     prologo vpn
