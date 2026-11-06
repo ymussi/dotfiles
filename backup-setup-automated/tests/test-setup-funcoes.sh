@@ -455,6 +455,29 @@ echo "== configuracao local fora do repo (repo publico)"
     chk "sem nome privado do harness nos scripts e no README" "$T/o" test ! -s "$T/o"
 )
 
+echo "== /swap.img: so ajusta o que ja existe (do PR #1)"
+(
+    prologo swap
+    BINS="$T/bin-swap"; mkdir -p "$BINS"
+    for c in mkswap swapon swapoff; do printf '#!/bin/sh\necho "%s $*" >> "%s"\nexit 0\n' "$c" "$T/swap.calls" > "$BINS/$c"; done
+    chmod +x "$BINS"/*; export PATH="$BINS:$PATH"
+    SWAP_IMG="$T/swap.img"; SWAP_DISK_SIZE=2M; : > "$T/swap.calls"
+    swap_disco > "$T/o" 2>&1; rc=$?
+    chk "sem /swap.img: nao cria, rc 0" "$T/o" bash -c "[ $rc -eq 0 ] && [ ! -e '$T/swap.img' ] && [ ! -s '$T/swap.calls' ]"
+    truncate -s 1M "$T/swap.img"
+    swap_disco > "$T/o" 2>&1; rc=$?
+    chk "tamanho diferente: troca pelo novo (2M), mkswap no novo, swapon" "$T/o" bash -c "[ $rc -eq 0 ] && [ \$(stat -c %s '$T/swap.img') -eq 2097152 ] && grep -q 'mkswap $T/swap.img.novo' '$T/swap.calls' && grep -q 'swapon $T/swap.img' '$T/swap.calls' && [ ! -e '$T/swap.img.novo' ]"
+    : > "$T/swap.calls"
+    swap_disco > "$T/o" 2>&1; rc=$?
+    chk "ja no tamanho: nao mexe" "$T/o" bash -c "[ $rc -eq 0 ] && grep -q 'ja tem 2M' '$T/o' && [ ! -s '$T/swap.calls' ]"
+    printf '#!/bin/sh\nexit 1\n' > "$BINS/fallocate"; chmod +x "$BINS/fallocate"; SWAP_DISK_SIZE=4M
+    swap_disco > "$T/o" 2>&1; rc=$?
+    chk "fallocate falhou: o antigo continua (2M), sem swapoff" "$T/o" bash -c "[ $rc -eq 1 ] && [ \$(stat -c %s '$T/swap.img') -eq 2097152 ] && ! grep -q swapoff '$T/swap.calls'"
+    SWAP_DISK_SIZE=abc
+    swap_disco > "$T/o" 2>&1; rc=$?
+    chk "SWAP_DISK_SIZE invalido: rc 1" "$T/o" bash -c "[ $rc -eq 1 ] && grep -q invalido '$T/o'"
+)
+
 echo "== perfis de VPN do NetworkManager"
 (
     prologo vpn

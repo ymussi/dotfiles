@@ -49,7 +49,7 @@
 # Variaveis opcionais: GIT_USER_NAME, GIT_USER_EMAIL (so usadas se o backup nao
 # trouxe o ~/.gitconfig), ZRAM_ALGO_0/ZRAM_ALGO_1, ZRAM_MB_0/ZRAM_MB_1
 # (padrao: metade da RAM, dividida entre os dois),
-# SWAP_FILE_GB (padrao 8), NODE_MAJOR (padrao 24), PY_VERSAO (padrao 3.12),
+# SWAP_DISK_SIZE (padrao 8G; so ajusta um /swap.img que ja existe), NODE_MAJOR (padrao 24), PY_VERSAO (padrao 3.12),
 # SNAP_TMO (segundos por snap; padrao 300), SNAP_PULAR (snaps a nao instalar, separados por espaco;
 # ex.: SNAP_PULAR=spotify se o snap travar de novo).
 #
@@ -67,7 +67,8 @@ set -uo pipefail
 
 NODE_MAJOR="${NODE_MAJOR:-24}"
 PY_VERSAO="${PY_VERSAO:-3.12}"
-SWAP_FILE_GB="${SWAP_FILE_GB:-8}"
+# Tamanho do /swap.img no formato do fallocate/numfmt (8G, 4G, 2048M). SWAP_FILE_GB (numero em GB) ainda vale.
+SWAP_DISK_SIZE="${SWAP_DISK_SIZE:-${SWAP_FILE_GB:+${SWAP_FILE_GB}G}}"; SWAP_DISK_SIZE="${SWAP_DISK_SIZE:-8G}"
 SNAP_TMO="${SNAP_TMO:-300}"
 SNAP_PULAR="${SNAP_PULAR:-}"
 # zram: ~50% da RAM, metade em cada dispositivo. A MemTotal e arredondada para cima em multiplo de 2 GiB
@@ -700,7 +701,7 @@ etapa_displaylink() {
 }
 
 #==============================================================================
-# 9. zram (50% da RAM: zram0 lzo-rle + zram1 zstd, metade cada) e swap em disco
+# 9. zram (50% da RAM: zram0 lzo-rle + zram1 zstd, metade cada) e o tamanho do /swap.img que ja existe
 #==============================================================================
 etapa_zram() {
     apt_garante systemd-zram-generator || return 1
@@ -731,22 +732,37 @@ vm.watermark_scale_factor = 125'; g=$?
     else
         warn "zram nao subiu: /etc/sysctl.d/99-zram.conf (swappiness 180) NAO gravado"; rc=1
     fi
-    # swap em disco: o instalador do Ubuntu cria /swap.img; so ajusta se o tamanho divergir.
-    if [ -f /swap.img ]; then
-        local atual alvo; atual="$(sudo stat -c %s /swap.img)"; alvo=$((SWAP_FILE_GB * 1073741824))
-        if [ "$atual" -ne "$alvo" ]; then
-            info "ajustando /swap.img para ${SWAP_FILE_GB}G"
-            sudo swapoff /swap.img 2>/dev/null || true
-            sudo rm -f /swap.img && sudo fallocate -l "${SWAP_FILE_GB}G" /swap.img && sudo chmod 600 /swap.img \
-                && sudo mkswap /swap.img >/dev/null && sudo swapon /swap.img || return 1
-        else skip "/swap.img ${SWAP_FILE_GB}G"; fi
-    else
-        info "criando /swap.img de ${SWAP_FILE_GB}G"
-        sudo fallocate -l "${SWAP_FILE_GB}G" /swap.img && sudo chmod 600 /swap.img && sudo mkswap /swap.img >/dev/null \
-            && sudo swapon /swap.img || return 1
-    fi
-    grep -qE '^/swap\.img[[:space:]]' /etc/fstab || echo '/swap.img none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+    swap_disco || rc=1
     return $rc
+}
+
+# Swap em disco: o instalador do Ubuntu cria /swap.img. So ajusta o tamanho de um /swap.img que JA existe; sem ele,
+# nao cria swap do zero nem mexe no fstab (a instalacao pode ter escolhido outro esquema). O arquivo novo e montado
+# ao lado e so substitui o antigo depois do mkswap; se faltar espaco ou algo falhar, o antigo continua.
+# SWAP_IMG: so para teste.
+swap_disco() {
+    local img="${SWAP_IMG:-/swap.img}" alvo atual novo
+    alvo="$(numfmt --from=iec "$SWAP_DISK_SIZE" 2>/dev/null)" || alvo=""
+    [ -n "$alvo" ] && [ "$alvo" -gt 0 ] 2>/dev/null || { warn "SWAP_DISK_SIZE invalido: $SWAP_DISK_SIZE"; return 1; }
+    if ! sudo test -f "$img"; then
+        skip "$img nao existe: nao crio swap em disco do zero (fica so o zram)"; return 0
+    fi
+    atual="$(sudo stat -c %s "$img")"
+    if [ "$atual" -eq "$alvo" ]; then skip "$img ja tem $SWAP_DISK_SIZE"; return 0; fi
+    info "ajustando $img de $(numfmt --to=iec "$atual") para $SWAP_DISK_SIZE"
+    novo="$img.novo"
+    sudo rm -f -- "$novo"
+    if ! { sudo fallocate -l "$alvo" "$novo" && sudo chmod 600 "$novo" && sudo mkswap "$novo" >/dev/null; }; then
+        sudo rm -f -- "$novo"; warn "nao montei o $img novo (espaco?); o antigo continua"; return 1
+    fi
+    sudo swapoff "$img" 2>/dev/null || true
+    if sudo mv -f -- "$novo" "$img" && sudo swapon "$img"; then
+        info "$img com $SWAP_DISK_SIZE e ativo"
+    else
+        warn "$img trocado mas o swapon falhou (confira a linha do swap no /etc/fstab)"; return 1
+    fi
+    awk -v i="$img" '$1 == i {f=1} END {exit !f}' /etc/fstab 2>/dev/null || warn "$img sem linha no /etc/fstab: nao vale no proximo boot (nao edito o fstab)"
+    return 0
 }
 
 #==============================================================================
