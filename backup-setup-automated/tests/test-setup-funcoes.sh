@@ -359,6 +359,28 @@ EOF
     chk "nao liga unit nenhuma; lista a opt-in que estava ligada na origem" "$T/o" bash -c "! grep -qE '(^| )(enable|start)( |$)' '$T/systemctl.calls' && grep -q 'enable --now rotina-cara.timer' '$T/o' && ! grep -q gnome-x '$T/o'"
 )
 
+echo "== acesso remoto e energia sao opt-in"
+(
+    prologo optin
+    apt_garante() { printf '%s\n' "$@" >> "$T/apt.args"; }
+    grava_root() { echo "$1" >> "$T/grava.args"; return 1; }
+    snap_instala() { return 0; }
+    INV="$T/inv-optin"; mkdir -p "$INV"; printf 'openssh-server\nxrdp\njq\nteamviewer\n' > "$INV/apt-manual.txt"
+    : > "$T/apt.args"; NOTAS_FIM=()
+    etapa_pacotes > "$T/o" 2>&1 < /dev/null
+    chk "pacotes do backup sem --acesso-remoto: ssh, xrdp e teamviewer ficam de fora" "$T/o" bash -c "grep -qx jq '$T/apt.args' && ! grep -qxE 'openssh-server|xrdp|teamviewer' '$T/apt.args'"
+    : > "$T/apt.args"; ACESSO_REMOTO=true
+    etapa_pacotes > "$T/o" 2>&1 < /dev/null
+    chk "com --acesso-remoto: entram" "$T/o" bash -c "grep -qx openssh-server '$T/apt.args' && grep -qx xrdp '$T/apt.args'"
+    ACESSO_REMOTO=false; : > "$T/grava.args"; NOTAS_FIM=()
+    etapa_energia > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "energia sem --sem-suspender: nao grava logind nem mascara nada, e deixa nota" "$T/o" bash -c "[ $rc -eq 0 ] && [ ! -s '$T/grava.args' ] && grep -q 'como o Ubuntu entrega' '$T/o'"
+    [ "${#NOTAS_FIM[@]}" -eq 1 ] && ok "nota do fim cita --sem-suspender" || nok "nota do fim cita --sem-suspender"
+    chk "--help documenta --acesso-remoto e --sem-suspender" "$T/o" bash -c "bash '$SETUP' --help | grep -q -- --acesso-remoto && bash '$SETUP' --help | grep -q -- --sem-suspender"
+    grep -nE '^\s+(openssh-client|sshpass).*\b(openssh-server|xrdp)\b' "$SETUP" > "$T/o"
+    chk "lista padrao do apt nao tem openssh-server nem xrdp" "$T/o" test ! -s "$T/o"
+)
+
 echo "== perfis de VPN do NetworkManager"
 (
     prologo vpn

@@ -23,6 +23,13 @@ Backup completo e setup de uma máquina Ubuntu 26.10 "Stonking Stingray" (dev/De
 ./ubuntu-setup-automated.sh --restore /run/media/$USER/<disco>/backup-ubuntu-<host>-<data>
 ```
 
+Duas coisas ficam de fora do padrão e o resumo do fim lembra como ligar:
+
+- `--acesso-remoto`: `openssh-server` (porta 22), `xrdp` (3389) e TeamViewer. Sem a opção não entram, nem pela lista de
+  pacotes do backup. Com ela, feche com firewall (`ufw`) e `PasswordAuthentication no` no `sshd`; o setup não faz isso.
+- `--sem-suspender`: máquina sempre ligada (tampa e ocioso ignorados, sleep/suspend/hibernate mascarados, Wi-Fi sem economia,
+  perfil performance). Sem a opção, a energia fica como o Ubuntu entrega.
+
 `./ubuntu-setup-automated.sh --help` lista as opções (`--pular`, `--so`, `--sem-harness`, `--ignorar-sha256`, `--refazer-restore`, `--delta`, `--limpa-efi-windows`...).
 Depois do setup: logout/login (grupo docker, shell zsh) e reboot (o `claude-remote` sobe no boot).
 Destino aceito: NTFS, exFAT, ext4. FAT32 é recusado (limite de 4 GB por arquivo).
@@ -73,8 +80,8 @@ O destino não pode estar num repo git nem no HOME: o arquivo leva segredos.
 `apt` (base + extras de uso) → `restore` (devolve o backup: segredos e logins vêm antes de tudo) → `delta` (só com `--delta`) → `docker` → `node` (nvm + NodeSource) →
 `uv` (+ Python 3.12) → `gh` → `aws` (CLI v2, session-manager-plugin, aws_signing_helper) → `terraform` → `kubectl` (helm, k9s, argocd) →
 `cli-extra` (stern, lazygit, trivy, actionlint, kubectx) → `kiro` (CLI **e IDE**) → `claude` → `cli-ia` (Gemini CLI, xo-cli) → `rclone` →
-`tailscale` → `vpn` (openvpn3) → `apps` (Chrome, VS Code, Firefox, Telegram, Slack, Spotify, Postman, btop, DBeaver, TeamViewer) →
-`displaylink` → `zram` (50% da RAM, metade em cada dispositivo, mais `99-zram.conf`) → `energia` (nunca suspende: tampa, ocioso e sleep mascarado; Wi-Fi sem powersave; perfil performance; driver de vídeo Intel só se houver GPU Intel) → `playwright` → `shell` (zsh + oh-my-zsh) → `pacotes` (reinstala as listas do backup: apt, snap, npm -g,
+`tailscale` → `vpn` (openvpn3) → `apps` (Chrome, VS Code, Firefox, Telegram, Slack, Spotify, Postman, btop, DBeaver; TeamViewer só com `--acesso-remoto`) →
+`displaylink` → `zram` (50% da RAM, metade em cada dispositivo, mais `99-zram.conf`) → `energia` (driver de vídeo Intel só se houver GPU Intel; com `--sem-suspender`, nunca suspende: tampa, ocioso e sleep mascarado, Wi-Fi sem powersave, perfil performance) → `playwright` → `shell` (zsh + oh-my-zsh) → `pacotes` (reinstala as listas do backup: apt, snap, npm -g,
 extensões do VS Code e do Kiro, pip, uv, pipx, gh, dconf, cron) → `projetos` (clona os repos que não estavam no tar) → `git-integridade` →
 `harness` (clona `dotfiles-claude`, só na branch `main` e sem commit local fora do remoto roda o `install.sh` e liga o linger; não liga unit nenhuma por conta própria: as que estavam ligadas na origem e o `install.sh` deixa desligadas são listadas no fim, para ligar numa máquina só). O estado de guardrail do harness (`~/.claude/change-*`: aprovações registradas e a chave do bypass) não migra: o restore e o delta não o extraem → `efi-windows` (só com `--limpa-efi-windows`).
 

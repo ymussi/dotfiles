@@ -18,6 +18,11 @@
 #                       do backup principal.
 #   --limpa-efi-windows remove a entrada "Windows Boot Manager" (efibootmgr) e EFI/Microsoft da ESP.
 #                       So com esta opcao, so com terminal, e so depois de voce digitar APAGAR.
+#   --acesso-remoto     instala o que abre a maquina para acesso pela rede: openssh-server (porta 22),
+#                       xrdp (3389) e TeamViewer. Sem esta opcao ficam de fora (tambem na lista do backup).
+#   --sem-suspender     maquina sempre ligada: ignora a tampa e o ocioso, mascara sleep/suspend/hibernate,
+#                       Wi-Fi sem economia de energia e perfil de energia performance. Sem esta opcao,
+#                       a energia fica como o Ubuntu entrega.
 #   --auto-restore      procura backup-ubuntu-* em /media/$USER/* e usa o mais novo.
 #   --sem-harness       nao clona o dotfiles-claude nem roda o install.sh dele.
 #   --sem-displaylink   pula o driver DisplayLink (dock USB).
@@ -82,6 +87,9 @@ TMO() { timeout "$@"; }
 ETAPAS=(apt restore delta docker node uv gh aws terraform kubectl cli-extra kiro claude cli-ia rclone tailscale vpn apps displaylink zram energia playwright shell pacotes projetos git-integridade harness efi-windows)
 RESTORE_ARG=""; AUTO_RESTORE=false; SEM_PROJ=false; IGNORA_SHA=false
 REFAZ_RESTORE=false; DELTA_ARG=""; LIMPA_EFI=false
+ACESSO_REMOTO=false; SEM_SUSPENDER=false
+# Pacotes que abrem a maquina para acesso pela rede: so com --acesso-remoto
+ACESSO_REMOTO_PKGS=(openssh-server xrdp)
 declare -A PULAR=() SO=()
 FALHAS=()
 NOTAS_FIM=()
@@ -96,6 +104,8 @@ while [ $# -gt 0 ]; do
         --refazer-restore) REFAZ_RESTORE=true ;;
         --delta) shift; DELTA_ARG="${1:-}"; [ -n "$DELTA_ARG" ] || { erro "--delta pede um arquivo (ou auto)"; exit 2; } ;;
         --limpa-efi-windows) LIMPA_EFI=true ;;
+        --acesso-remoto) ACESSO_REMOTO=true ;;
+        --sem-suspender) SEM_SUSPENDER=true ;;
         --sem-harness) PULAR[harness]=1 ;;
         --sem-displaylink) PULAR[displaylink]=1 ;;
         --sem-projetos) SEM_PROJ=true ;;
@@ -227,7 +237,7 @@ etapa_apt() {
     apt_garante build-essential git curl wget ca-certificates gnupg unzip zip jq tmux zsh vim \
         software-properties-common apt-transport-https lsb-release pkg-config openssl age \
         ripgrep fd-find fzf tree htop net-tools bind9-dnsutils iproute2 rsync xclip \
-        openssh-client openssh-server gpg-agent dconf-cli \
+        openssh-client gpg-agent dconf-cli \
         python3 python3-venv python3-pip python3-dev pipx \
         dkms "linux-headers-$(uname -r)" linux-headers-generic \
         fuse3 \
@@ -237,8 +247,15 @@ etapa_apt() {
     apt_um_ou_outro libfuse2t64 libfuse2 || warn "libfuse2 nao instalou (AppImage)"
     # ferramentas de uso diario que estao nesta maquina (apt-mark showmanual): rede, arquivos, escritorio
     apt_garante aria2 cifs-utils nfs-common samba-common-bin ntfs-3g lvm2 efibootmgr nmap whois traceroute \
-        sshpass sqlite3 redis-server wireguard xrdp wl-clipboard fonts-firacode fprintd libpam-fprintd \
+        sshpass sqlite3 redis-server wireguard wl-clipboard fonts-firacode fprintd libpam-fprintd \
         freerdp3-x11 libreoffice pdfarranger simple-scan vlc libvhdi-utils libpng-dev || warn "alguns pacotes extras do apt nao instalaram"
+    if $ACESSO_REMOTO; then
+        apt_garante "${ACESSO_REMOTO_PKGS[@]}" || warn "acesso remoto: alguns pacotes nao instalaram"
+        warn "acesso remoto ligado: ssh (22) e xrdp (3389) escutam na rede. Feche com firewall (ufw) e 'PasswordAuthentication no' no sshd."
+    else
+        skip "acesso remoto (${ACESSO_REMOTO_PKGS[*]}, TeamViewer): fora sem --acesso-remoto"
+        NOTAS_FIM+=("acesso remoto (${ACESSO_REMOTO_PKGS[*]}, TeamViewer) nao instalado: --acesso-remoto instala")
+    fi
     return 0
 }
 
@@ -445,8 +462,9 @@ etapa_apps() {
         fl=(); [ "$app" = slack ] && fl=(--classic)
         snap_instala "$app" "${fl[@]}" || rc=1
     done
-    # TeamViewer (deb oficial; o pacote cria o repo apt dele)
-    if ! tem teamviewer; then
+    # TeamViewer (deb oficial; o pacote cria o repo apt dele): acesso remoto, so com --acesso-remoto
+    if ! $ACESSO_REMOTO; then skip "teamviewer (so com --acesso-remoto)"
+    elif ! tem teamviewer; then
         local d; d="$(tmpd)"
         if baixa https://download.teamviewer.com/download/linux/teamviewer_amd64.deb "$d/tv.deb" 600; then
             TMO 900 sudo apt-get install -y "$d/tv.deb" || { warn "teamviewer nao instalou"; rc=1; }
@@ -644,10 +662,18 @@ vm.watermark_scale_factor = 125'; g=$?
 }
 
 #==============================================================================
-# 9b. Energia: sempre ligado (tampa, ocioso, sleep) e alta performance
+# 9b. Energia: driver de video Intel; com --sem-suspender, sempre ligado (tampa, ocioso, sleep) e performance
 #==============================================================================
 etapa_energia() {
     local rc=0
+    if tem lspci && lspci 2>/dev/null | grep -Ei 'vga|3d|display' | grep -qi intel; then
+        apt_garante intel-media-va-driver-non-free vainfo || rc=1
+    else skip "sem GPU Intel: driver de video pulado"; fi
+    if ! $SEM_SUSPENDER; then
+        skip "energia como o Ubuntu entrega (suspende, tampa e economia de energia normais)"
+        NOTAS_FIM+=("maquina sempre ligada (tampa, sleep mascarado, Wi-Fi sem economia, perfil performance) nao aplicada: --sem-suspender aplica")
+        return $rc
+    fi
     # a regra da tampa vale no proximo boot (reiniciar o logind derruba a sessao grafica)
     grava_root /etc/systemd/logind.conf.d/10-sempre-ligado.conf '[Login]
 HandleLidSwitch=ignore
@@ -668,9 +694,6 @@ wifi.powersave = 2'
         if [ "$(powerprofilesctl get 2>/dev/null)" = performance ]; then skip "perfil de energia: performance"
         else powerprofilesctl set performance || { warn "powerprofilesctl set performance falhou"; rc=1; }; fi
     else warn "powerprofilesctl ausente (power-profiles-daemon); perfil de energia nao ajustado"; fi
-    if tem lspci && lspci 2>/dev/null | grep -Ei 'vga|3d|display' | grep -qi intel; then
-        apt_garante intel-media-va-driver-non-free vainfo || rc=1
-    else skip "sem GPU Intel: driver de video pulado"; fi
     return $rc
 }
 
@@ -960,7 +983,8 @@ etapa_pacotes() {
     local ret=0 l nome have ext flag
     # apt: o que foi instalado a mao la, menos pacote de sistema, kernel, bootloader e metapacote de desktop
     if [ -s "$INV/apt-manual.txt" ]; then
-        l="$(grep -vE '^(linux-|grub|shim|ubuntu-|language-pack|ibus|libchewing|libpinyin|libopencc|libm17n|libotf|m17n|wbritish|bsdutils|dash$|diffutils|findutils|grep$|gzip|hostname|init$|login$|ncurses|python3-minimal|tailscale-archive|synaptics-repository)' "$INV/apt-manual.txt" || true)"
+        local fora_rede=(); $ACESSO_REMOTO || fora_rede=("${ACESSO_REMOTO_PKGS[@]}" teamviewer)
+        l="$(grep -vE '^(linux-|grub|shim|ubuntu-|language-pack|ibus|libchewing|libpinyin|libopencc|libm17n|libotf|m17n|wbritish|bsdutils|dash$|diffutils|findutils|grep$|gzip|hostname|init$|login$|ncurses|python3-minimal|tailscale-archive|synaptics-repository)' "$INV/apt-manual.txt" | grep -vxF -f <(printf '%s\n' "${fora_rede[@]+"${fora_rede[@]}"}" "#") || true)"
         # shellcheck disable=SC2086
         [ -z "$l" ] || apt_garante $l || { warn "apt: alguns pacotes da lista nao instalaram"; ret=1; }
     fi
