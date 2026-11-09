@@ -381,6 +381,55 @@ EOF
     chk "nao liga unit nenhuma; lista a opt-in que estava ligada na origem" "$T/o" bash -c "! grep -qE '(^| )(enable|start)( |$)' '$T/systemctl.calls' && grep -q 'enable --now rotina-cara.timer' '$T/o' && ! grep -q gnome-x '$T/o'"
 )
 
+echo "== harness: exit 3 do install.sh e divergencia que pede atencao (nem sucesso nem falha)"
+(
+    prologo harness3
+    cat > "$BIN/systemctl" <<EOF
+#!/bin/sh
+echo "\$*" >> "$T/systemctl3.calls"
+case "\$*" in *is-enabled*) exit 1 ;; esac
+exit 0
+EOF
+    printf '#!/bin/sh\necho Linger=yes\n' > "$BIN/loginctl"; chmod +x "$BIN/systemctl" "$BIN/loginctl"
+    git init -q --bare -b main "$T/harness3-origem.git"
+    git clone -q "$T/harness3-origem.git" "$T/harness3" 2>/dev/null
+    instala_com() { # instala_com CODIGO: install.sh falso que marca e sai com CODIGO
+        ( cd "$T/harness3" && printf '#!/bin/sh\necho rodou >> "%s"\nexit %s\n' "$T/install3.marca" "$1" > install.sh && chmod +x install.sh \
+            && git add install.sh && git -c user.name=t -c user.email=t@t commit -q -m "i$1" && git push -q origin main 2>/dev/null )
+    }
+    HARNESS_DIR="$T/harness3"; INV="$T/inv-harness3"; mkdir -p "$INV" "$HOME/.config/systemd/user"
+    printf 'rotina-cara.timer enabled enabled\n' > "$INV/systemd-user-enabled.txt"; : > "$HOME/.config/systemd/user/rotina-cara.timer"
+    instala_com 3
+    : > "$T/systemctl3.calls"; NOTAS_FIM=()
+    etapa_harness > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "install.sh sai 3: a etapa devolve 3 (nem 0 nem 1) e avisa que e divergencia, nao erro" "$T/o" bash -c "[ $rc -eq 3 ] && grep -q 'terminou com exit 3' '$T/o' && ! grep -q 'install.sh do harness falhou' '$T/o'"
+    chk "install.sh sai 3: a etapa para (sem daemon-reload nem lista de units) e deixa nota para o fim" "$T/o" bash -c "[ ! -s '$T/systemctl3.calls' ] && ! grep -q 'enable --now rotina-cara' '$T/o' && [ ${#NOTAS_FIM[@]} -eq 1 ]"
+    FALHAS=(); ATENCAO=()
+    executa_etapa harness etapa_harness > "$T/o" 2>&1 < /dev/null
+    chk "executa_etapa: exit 3 vai para ATENCAO e nao para FALHAS" "$T/o" bash -c "[ '${ATENCAO[*]:-}' = harness ] && [ ${#FALHAS[@]} -eq 0 ] && grep -q 'etapa pede atencao: harness' '$T/o'"
+    # o script inteiro (so a etapa harness): termina com 3 e diz que pede atencao; nem 0 nem 1
+    rm -f "$T/install3.marca"
+    env -u SETUP_SO_FUNCOES HOME="$HOME" PATH="$PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null HARNESS_DIR="$T/harness3" HARNESS_BRANCH=main \
+        bash "$SETUP" --so harness > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "script inteiro com install.sh 3: sai 3, instala uma vez e nao diz 'sem falhas'" "$T/o" bash -c "[ $rc -eq 3 ] && [ \$(wc -l < '$T/install3.marca') -eq 1 ] && grep -q 'pede atencao em: harness' '$T/o' && ! grep -q 'Setup concluido sem falhas' '$T/o'"
+    # exit 1 continua sendo falha
+    instala_com 1
+    NOTAS_FIM=(); : > "$T/systemctl3.calls"
+    etapa_harness > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "install.sh sai 1: continua falha (rc 1, 'install.sh do harness falhou')" "$T/o" bash -c "[ $rc -eq 1 ] && grep -q 'install.sh do harness falhou' '$T/o' && [ ${#NOTAS_FIM[@]} -eq 0 ]"
+    FALHAS=(); ATENCAO=()
+    executa_etapa harness etapa_harness > "$T/o" 2>&1 < /dev/null
+    chk "executa_etapa: exit 1 vai para FALHAS" "$T/o" bash -c "[ '${FALHAS[*]:-}' = harness ] && [ ${#ATENCAO[@]} -eq 0 ]"
+    env -u SETUP_SO_FUNCOES HOME="$HOME" PATH="$PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null HARNESS_DIR="$T/harness3" HARNESS_BRANCH=main \
+        bash "$SETUP" --so harness > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "script inteiro com install.sh 1: sai 1 com 'falhas em: harness'" "$T/o" bash -c "[ $rc -eq 1 ] && grep -q 'falhas em: harness' '$T/o'"
+    # exit 0 conclui sem falhas
+    instala_com 0
+    env -u SETUP_SO_FUNCOES HOME="$HOME" PATH="$PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null HARNESS_DIR="$T/harness3" HARNESS_BRANCH=main \
+        bash "$SETUP" --so harness > "$T/o" 2>&1 < /dev/null; rc=$?
+    chk "script inteiro com install.sh 0: sai 0, 'sem falhas'" "$T/o" bash -c "[ $rc -eq 0 ] && grep -q 'Setup concluido sem falhas' '$T/o'"
+)
+
 echo "== acesso remoto e energia sao opt-in"
 (
     prologo optin
