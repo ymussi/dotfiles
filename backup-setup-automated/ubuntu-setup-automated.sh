@@ -35,6 +35,9 @@
 #   --listar            lista as etapas e sai.
 #   -h, --help
 #
+# Saida: 0 sem falhas; 1 se alguma etapa falhou; 3 se nenhuma falhou mas alguma pede atencao (a etapa harness,
+# quando o install.sh dele sai 3: a maquina diverge do repositorio do harness e ele parou sem sobrescrever nada).
+#
 # Configuracao local (fora do repo): ~/.config/backup-ubuntu-setup.conf (ou SETUP_CONF), linhas CHAVE=valor,
 # lidas e nunca executadas; variavel de ambiente com o mesmo nome vence. Como fica em ~/.config, vai junto no
 # backup e ja esta la quando o restore termina. Chaves:
@@ -137,6 +140,7 @@ ACESSO_REMOTO=false; SEM_SUSPENDER=false
 ACESSO_REMOTO_PKGS=(openssh-server xrdp)
 declare -A PULAR=() SO=()
 FALHAS=()
+ATENCAO=()   # etapa que terminou com exit 3: divergencia que pede atencao, nem sucesso nem falha
 NOTAS_FIM=()
 
 uso() { sed -n '3,/^#====.*$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
@@ -182,7 +186,13 @@ executa_etapa() { # executa_etapa nome funcao
     if [ ${#SO[@]} -gt 0 ] && [ -z "${SO[$nome]:-}" ]; then return 0; fi
     if [ -n "${PULAR[$nome]:-}" ]; then skip "etapa pulada: $nome"; return 0; fi
     secao "$nome"
-    if ! "$fn"; then warn "etapa com falha: $nome"; FALHAS+=("$nome"); fi
+    local rc=0
+    "$fn" || rc=$?
+    case "$rc" in
+        0) ;;
+        3) warn "etapa pede atencao: $nome (nao e falha do setup; veja o aviso acima)"; ATENCAO+=("$nome") ;;
+        *) warn "etapa com falha: $nome"; FALHAS+=("$nome") ;;
+    esac
 }
 
 # grava_root ARQUIVO CONTEUDO: grava como root so se o conteudo mudou.
@@ -1268,7 +1278,16 @@ etapa_harness() {
     # linger: os servicos do usuario sobem no boot sem login grafico
     loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q 'Linger=yes' || sudo loginctl enable-linger "$USER"
     # O install.sh linka config, binarios e units systemd --user, cria as venvs e liga o que e padrao dele
-    ( cd "$HARNESS_DIR" && TMO 1800 ./install.sh ) || { erro "install.sh do harness falhou"; return 1; }
+    # Exit 3 do install.sh = a maquina diverge do que o repositorio do harness declara. Ele parou sem sobrescrever nada
+    # e avisou: nao e erro (1) nem sucesso (0). A etapa para aqui (sem daemon-reload nem lista de units) e devolve 3.
+    local rc=0
+    ( cd "$HARNESS_DIR" && TMO 1800 ./install.sh ) || rc=$?
+    if [ "$rc" -eq 3 ]; then
+        warn "install.sh do harness terminou com exit 3: esta maquina diverge do que o repositorio do harness declara. Ele parou sem sobrescrever nada e avisou acima o que difere. A etapa NAO foi concluida (nao e erro do setup): resolva a divergencia e repita com --so harness."
+        NOTAS_FIM+=("harness: install.sh parou com divergencia (exit 3); etapa nao concluida, repita com --so harness depois de resolver")
+        return 3
+    fi
+    [ "$rc" -eq 0 ] || { erro "install.sh do harness falhou (saida $rc)"; return 1; }
     systemctl --user daemon-reload 2>/dev/null || true
     # Nao religa nada por conta propria: o que estava ligado na maquina de origem e o install.sh deixou
     # desligado e opt-in (rotinas que gastam credito, sessoes remotas). Ligar nas duas maquinas duplica custo.
@@ -1383,9 +1402,13 @@ if [ ${#NOTAS_FIM[@]} -gt 0 ]; then
     warn "Ficou de fora de proposito:"
     printf '    - %s\n' "${NOTAS_FIM[@]}"
 fi
-if [ ${#FALHAS[@]} -eq 0 ]; then
-    info "Setup concluido sem falhas. Faca logout/login (grupo docker, shell zsh) e reinicie para os servicos do usuario subirem no boot."
-else
+if [ ${#FALHAS[@]} -gt 0 ]; then
     warn "Setup concluido com falhas em: ${FALHAS[*]}. Rode de novo (so refaz o que falta) ou use --so <etapa>."
+    [ ${#ATENCAO[@]} -eq 0 ] || warn "Alem disso, pede atencao (divergencia, nao falha): ${ATENCAO[*]}."
     exit 1
+elif [ ${#ATENCAO[@]} -gt 0 ]; then
+    warn "Setup concluido, mas pede atencao em: ${ATENCAO[*]} (divergencia, nao falha; a etapa parou sem terminar). Resolva e repita com --so <etapa>."
+    exit 3
+else
+    info "Setup concluido sem falhas. Faca logout/login (grupo docker, shell zsh) e reinicie para os servicos do usuario subirem no boot."
 fi
